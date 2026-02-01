@@ -133,6 +133,12 @@ public:
     
     ProductionStats getStats(std::optional<ProductionLineId> lineId = std::nullopt);
 
+    // =========================================================================
+    // Database Access
+    // =========================================================================
+    
+    QSqlDatabase getDatabase();
+
 signals:
     void connectionLost();
     void connectionRestored();
@@ -140,7 +146,6 @@ signals:
 
 private:
     bool ensureConnected();
-    QSqlDatabase getDatabase();
     
     // Import helpers
     ImportResult doImport(const QString& filePath, ProductionLineId lineId,

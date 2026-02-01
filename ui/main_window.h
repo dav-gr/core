@@ -8,8 +8,8 @@
 #include <memory>
 #include <optional>
 
-#include "core/db_service.h"
-#include "core/types.h"
+#include "../db/db_service.h"
+#include "../db/types.h"
 
 namespace core {
 /**

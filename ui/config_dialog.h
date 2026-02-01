@@ -7,7 +7,7 @@
 #include <QPushButton>
 #include <QLabel>
 
-#include "types.h"
+#include "../db/types.h"
 
 namespace core {
 

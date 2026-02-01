@@ -1,6 +1,6 @@
 #include "login_dialog.h"
-#include "password_util.h"
-#include "db_service.h"
+#include "../utils/password_util.h"
+#include "../db/db_service.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>

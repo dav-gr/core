@@ -1,5 +1,5 @@
 #include "config_dialog.h"
-#include "db_service.h"
+#include "../db/db_service.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>

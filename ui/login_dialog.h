@@ -1,7 +1,7 @@
 #ifndef CORE_LOGIN_DIALOG_H
 #define CORE_LOGIN_DIALOG_H
 
-#include "types.h"
+#include "../db/types.h"
 
 #include <QDialog>
 #include <QLineEdit>
