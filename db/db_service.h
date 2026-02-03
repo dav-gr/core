@@ -69,6 +69,57 @@ public:
     std::optional<ProductionLine> getProductionLine(ProductionLineId id);
 
     // =========================================================================
+    // Products (SYNC)
+    // =========================================================================
+
+    QVector<Product> getProducts();
+    std::optional<Product> getProduct(ProductId id);
+    bool createProduct(const Product& product);
+    bool updateProduct(const Product& product);
+    bool deleteProduct(ProductId id);
+
+    // =========================================================================
+    // Product Packaging (SYNC)
+    // =========================================================================
+
+    QVector<ProductPackaging> getProductPackaging();
+    std::optional<ProductPackaging> getPackaging(ProductPackagingId id);
+    bool createPackaging(const ProductPackaging& packaging);
+    bool updatePackaging(const ProductPackaging& packaging);
+    bool deletePackaging(ProductPackagingId id);
+
+    // =========================================================================
+    // User Management (SYNC)
+    // =========================================================================
+
+    QVector<User> getUsers();
+    bool createUser(const User& user);
+    bool updateUser(const User& user);
+    bool deleteUser(UserId userId);
+
+    // =========================================================================
+    // Role Management (SYNC)
+    // =========================================================================
+
+    QVector<Role> getRoles();
+    std::optional<Role> getRole(RoleId roleId);
+    bool createRole(const Role& role);
+    bool updateRole(const Role& role);
+    bool deleteRole(RoleId roleId);
+    QVector<Role> getUserRoles(UserId userId);
+    bool assignRoleToUser(UserId userId, RoleId roleId);
+    bool removeRoleFromUser(UserId userId, RoleId roleId);
+
+    // =========================================================================
+    // Permission Management (SYNC)
+    // =========================================================================
+
+    QVector<Permission> getPermissions();
+    QVector<Permission> getRolePermissions(RoleId roleId);
+    bool assignPermissionToRole(RoleId roleId, qint32 permissionId);
+    bool removePermissionFromRole(RoleId roleId, qint32 permissionId);
+
+    // =========================================================================
     // Import Operations (ASYNC)
     // =========================================================================
     
@@ -99,6 +150,8 @@ public:
     QVector<Box> getBoxesByStatus(BoxStatus status, 
                                    ProductionLineId lineId = 0,
                                    int limit = 100);
+    QVector<Box> getSealedBoxesNotOnPallet(ProductionLineId lineId = 0, int limit = 200);
+    int countSealedBoxesNotOnPallet(ProductionLineId lineId = 0);
     QVector<Box> getBoxesOnPallet(PalletId palletId);
     bool sealBox(BoxId id);
     bool assignBoxToPallet(BoxId boxId, PalletId palletId);
@@ -126,6 +179,9 @@ public:
     
     std::optional<ExportDocument> getExportDocument(ExportDocumentId id);
     QVector<ExportDocument> getExportDocuments(int limit = 50, int offset = 0);
+    int getExportDocumentItemCount(ExportDocumentId id);
+    int getExportDocumentBoxCount(ExportDocumentId id);
+    int getExportDocumentPalletCount(ExportDocumentId id);
 
     // =========================================================================
     // Statistics (SYNC)
@@ -154,6 +210,9 @@ private:
     // Export helpers
     ExportResult doExportBoxes(const QVector<BoxId>& boxIds, const QString& lpTin);
     ExportResult doExportPallets(const QVector<PalletId>& palletIds, const QString& lpTin);
+    QString generateBoxExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
+    QString generatePalletExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
+    QString cleanBarcodeForExport(const QString& barcode);
     
     // Parse helpers
     User parseUser(const QSqlQuery& query);
@@ -163,6 +222,8 @@ private:
     Box parseBox(const QSqlQuery& query);
     Pallet parsePallet(const QSqlQuery& query);
     ExportDocument parseExportDocument(const QSqlQuery& query);
+    Product parseProduct(const QSqlQuery& query);
+    ProductPackaging parseProductPackaging(const QSqlQuery& query);
     
     QString buildPlaceholders(const QStringList& values);
 

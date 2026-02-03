@@ -428,31 +428,38 @@ if (!db.isOpen()) {
     for (int i = 0; i < barcodes.size(); i += batchSize) {
         QStringList batch = barcodes.mid(i, qMin(batchSize, barcodes.size() - i));
         
-        QStringList valuesList;
-        for (const QString& bc : batch) {
-            QString escaped = QString(bc).replace("'", "''");
-            valuesList.append(QString("('%1', %2, 0, NOW())")
-                .arg(escaped).arg(lineId));
+        // Build parameterized query with placeholders
+        QStringList valuePlaceholders;
+        for (int j = 0; j < batch.size(); ++j) {
+            valuePlaceholders.append(QString("(:bc%1, :lineId, 0, NOW())").arg(j));
         }
         
         QString sql = QString(
             "INSERT INTO %1 (bar_code, production_line, status, %2) "
             "VALUES %3 ON CONFLICT (bar_code) DO NOTHING"
-        ).arg(tableName, timestampCol, valuesList.join(", "));
+        ).arg(tableName, timestampCol, valuePlaceholders.join(", "));
         
-    QSqlQuery query(db);
-    if (query.exec(sql)) {
-        int affected = query.numRowsAffected();
-        result.importedCount += affected;
-        result.skippedCount += batch.size() - affected;
-    } else {
-        result.errorCount += batch.size();
-        result.errors.append(query.lastError().text());
+        QSqlQuery query(db);
+        query.prepare(sql);
+        
+        // Bind each barcode value safely
+        for (int j = 0; j < batch.size(); ++j) {
+            query.bindValue(QString(":bc%1").arg(j), batch[j]);
+        }
+        query.bindValue(":lineId", lineId);
+        
+        if (query.exec()) {
+            int affected = query.numRowsAffected();
+            result.importedCount += affected;
+            result.skippedCount += batch.size() - affected;
+        } else {
+            result.errorCount += batch.size();
+            result.errors.append(query.lastError().text());
+        }
+        
+        processed += batch.size();
+        emit importProgress(processed, result.totalRecords);
     }
-        
-    processed += batch.size();
-    emit importProgress(processed, result.totalRecords);
-}
     
 if (result.errorCount == 0) {
     db.commit();
@@ -685,6 +692,67 @@ QVector<Box> DbService::getBoxesByStatus(BoxStatus status, ProductionLineId line
     }
     
     return boxes;
+}
+
+QVector<Box> DbService::getSealedBoxesNotOnPallet(ProductionLineId lineId, int limit) {
+    QVector<Box> boxes;
+    
+    if (!ensureConnected()) return boxes;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    QString sql = 
+        "SELECT b.id, b.bar_code, b.status, b.production_line, b.imported_at, b.sealed_at "
+        "FROM boxes b "
+        "LEFT JOIN pallet_box_assignments pba ON b.id = pba.box_id "
+        "WHERE b.status = 1 AND pba.box_id IS NULL";
+    
+    if (lineId > 0) {
+        sql += " AND b.production_line = :lineId";
+    }
+    sql += " ORDER BY b.imported_at LIMIT :limit";
+    
+    query.prepare(sql);
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    query.bindValue(":limit", limit);
+    
+    if (query.exec()) {
+        while (query.next()) {
+            boxes.append(parseBox(query));
+        }
+    }
+    
+    return boxes;
+}
+
+int DbService::countSealedBoxesNotOnPallet(ProductionLineId lineId) {
+    if (!ensureConnected()) return 0;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    QString sql = 
+        "SELECT COUNT(*) FROM boxes b "
+        "LEFT JOIN pallet_box_assignments pba ON b.id = pba.box_id "
+        "WHERE b.status = 1 AND pba.box_id IS NULL";
+    
+    if (lineId > 0) {
+        sql += " AND b.production_line = :lineId";
+    }
+    
+    query.prepare(sql);
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    
+    return 0;
 }
 
 QVector<Box> DbService::getBoxesOnPallet(PalletId palletId) {
@@ -1079,10 +1147,27 @@ if (!updateItemsQuery.exec(updateItemsSql)) {
     return result;
 }
     
+    
 db.commit();
 result.success = true;
     
 qDebug() << "DbService: Export complete - Doc:" << result.documentId;
+
+// Generate XML content
+QString xmlContent = generateBoxExportXml(result.documentId, lpTin, db);
+
+// Update document with XML content
+QSqlQuery updateXmlQuery(db);
+updateXmlQuery.prepare(
+    "UPDATE export_documents SET xml_content = :xml WHERE id = :id"
+);
+updateXmlQuery.bindValue(":xml", xmlContent.toUtf8());
+updateXmlQuery.bindValue(":id", result.documentId);
+
+if (!updateXmlQuery.exec()) {
+    qDebug() << "Warning: Failed to update XML content:" << updateXmlQuery.lastError().text();
+}
+
 return result;
 }
 
@@ -1249,10 +1334,27 @@ ExportResult DbService::doExportPallets(const QVector<PalletId>& palletIds, cons
         return result;
     }
     
+    
     db.commit();
     result.success = true;
     
     qDebug() << "DbService: Pallet export complete - Doc:" << result.documentId;
+    
+    // Generate XML content
+    QString xmlContent = generatePalletExportXml(result.documentId, lpTin, db);
+    
+    // Update document with XML content
+    QSqlQuery updateXmlQuery(db);
+    updateXmlQuery.prepare(
+        "UPDATE export_documents SET xml_content = :xml WHERE id = :id"
+    );
+    updateXmlQuery.bindValue(":xml", xmlContent.toUtf8());
+    updateXmlQuery.bindValue(":id", result.documentId);
+    
+    if (!updateXmlQuery.exec()) {
+        qDebug() << "Warning: Failed to update XML content:" << updateXmlQuery.lastError().text();
+    }
+    
     return result;
 }
 
@@ -1297,6 +1399,54 @@ QVector<ExportDocument> DbService::getExportDocuments(int limit, int offset) {
     }
     
     return docs;
+}
+
+int DbService::getExportDocumentItemCount(ExportDocumentId id) {
+    if (!ensureConnected()) return 0;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("SELECT COUNT(*) FROM export_items WHERE document_id = :id");
+    query.bindValue(":id", id);
+    
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    
+    return 0;
+}
+
+int DbService::getExportDocumentBoxCount(ExportDocumentId id) {
+    if (!ensureConnected()) return 0;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("SELECT COUNT(*) FROM export_boxes WHERE document_id = :id");
+    query.bindValue(":id", id);
+    
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    
+    return 0;
+}
+
+int DbService::getExportDocumentPalletCount(ExportDocumentId id) {
+    if (!ensureConnected()) return 0;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("SELECT COUNT(*) FROM export_pallets WHERE document_id = :id");
+    query.bindValue(":id", id);
+    
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    
+    return 0;
 }
 
 // ============================================================================
@@ -1357,6 +1507,485 @@ ProductionStats DbService::getStats(std::optional<ProductionLineId> lineId) {
     }
     
     return stats;
+}
+
+// ============================================================================
+// Products
+// ============================================================================
+
+QVector<Product> DbService::getProducts() {
+    QVector<Product> products;
+    if (!ensureConnected()) return products;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    if (query.exec("SELECT id, gtin, name, description, created_at FROM products ORDER BY name")) {
+        while (query.next()) {
+            products.append(parseProduct(query));
+        }
+    }
+    return products;
+}
+
+std::optional<Product> DbService::getProduct(ProductId id) {
+    if (!ensureConnected()) return std::nullopt;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("SELECT id, gtin, name, description, created_at FROM products WHERE id = :id");
+    query.bindValue(":id", id);
+    
+    if (query.exec() && query.next()) {
+        return parseProduct(query);
+    }
+    return std::nullopt;
+}
+
+bool DbService::createProduct(const Product& product) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("INSERT INTO products (gtin, name, description) VALUES (:gtin, :name, :desc)");
+    query.bindValue(":gtin", product.gtin);
+    query.bindValue(":name", product.name);
+    query.bindValue(":desc", product.description);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+bool DbService::updateProduct(const Product& product) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("UPDATE products SET gtin = :gtin, name = :name, description = :desc WHERE id = :id");
+    query.bindValue(":gtin", product.gtin);
+    query.bindValue(":name", product.name);
+    query.bindValue(":desc", product.description);
+    query.bindValue(":id", product.id);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+bool DbService::deleteProduct(ProductId id) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("DELETE FROM products WHERE id = :id");
+    query.bindValue(":id", id);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+// ============================================================================
+// Product Packaging
+// ============================================================================
+
+QVector<ProductPackaging> DbService::getProductPackaging() {
+    QVector<ProductPackaging> packaging;
+    if (!ensureConnected()) return packaging;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    if (query.exec("SELECT id, product_id, number_of_products, gtin, name, description, created_at "
+                   "FROM product_packaging ORDER BY name")) {
+        while (query.next()) {
+            packaging.append(parseProductPackaging(query));
+        }
+    }
+    return packaging;
+}
+
+std::optional<ProductPackaging> DbService::getPackaging(ProductPackagingId id) {
+    if (!ensureConnected()) return std::nullopt;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("SELECT id, product_id, number_of_products, gtin, name, description, created_at "
+                  "FROM product_packaging WHERE id = :id");
+    query.bindValue(":id", id);
+    
+    if (query.exec() && query.next()) {
+        return parseProductPackaging(query);
+    }
+    return std::nullopt;
+}
+
+bool DbService::createPackaging(const ProductPackaging& pkg) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("INSERT INTO product_packaging (product_id, number_of_products, gtin, name, description) "
+                  "VALUES (:productId, :num, :gtin, :name, :desc)");
+    query.bindValue(":productId", pkg.productId);
+    query.bindValue(":num", pkg.numberOfProducts);
+    query.bindValue(":gtin", pkg.gtin);
+    query.bindValue(":name", pkg.name);
+    query.bindValue(":desc", pkg.description);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+bool DbService::updatePackaging(const ProductPackaging& pkg) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("UPDATE product_packaging SET product_id = :productId, number_of_products = :num, "
+                  "gtin = :gtin, name = :name, description = :desc WHERE id = :id");
+    query.bindValue(":productId", pkg.productId);
+    query.bindValue(":num", pkg.numberOfProducts);
+    query.bindValue(":gtin", pkg.gtin);
+    query.bindValue(":name", pkg.name);
+    query.bindValue(":desc", pkg.description);
+    query.bindValue(":id", pkg.id);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+bool DbService::deletePackaging(ProductPackagingId id) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("DELETE FROM product_packaging WHERE id = :id");
+    query.bindValue(":id", id);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+// ============================================================================
+// User Management
+// ============================================================================
+
+QVector<User> DbService::getUsers() {
+    QVector<User> users;
+    if (!ensureConnected()) return users;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    if (query.exec("SELECT id, username, pin_hash, full_name, email, phone_number, "
+                   "active, superuser, created_at, last_login FROM users ORDER BY username")) {
+        while (query.next()) {
+            users.append(parseUser(query));
+        }
+    }
+    return users;
+}
+
+bool DbService::createUser(const User& user) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("INSERT INTO users (username, pin_hash, full_name, email, phone_number, active, superuser) "
+                  "VALUES (:username, :pinHash, :fullName, :email, :phone, :active, :superuser)");
+    query.bindValue(":username", user.username);
+    query.bindValue(":pinHash", user.pinHash);
+    query.bindValue(":fullName", user.fullName);
+    query.bindValue(":email", user.email.isEmpty() ? QVariant() : user.email);
+    query.bindValue(":phone", user.phoneNumber.isEmpty() ? QVariant() : user.phoneNumber);
+    query.bindValue(":active", user.active);
+    query.bindValue(":superuser", user.superuser);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+bool DbService::updateUser(const User& user) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("UPDATE users SET username = :username, pin_hash = :pinHash, full_name = :fullName, "
+                  "email = :email, phone_number = :phone, active = :active, superuser = :superuser "
+                  "WHERE id = :id");
+    query.bindValue(":username", user.username);
+    query.bindValue(":pinHash", user.pinHash);
+    query.bindValue(":fullName", user.fullName);
+    query.bindValue(":email", user.email.isEmpty() ? QVariant() : user.email);
+    query.bindValue(":phone", user.phoneNumber.isEmpty() ? QVariant() : user.phoneNumber);
+    query.bindValue(":active", user.active);
+    query.bindValue(":superuser", user.superuser);
+    query.bindValue(":id", user.id);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+bool DbService::deleteUser(UserId userId) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("DELETE FROM users WHERE id = :id");
+    query.bindValue(":id", userId);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+// ============================================================================
+// Role Management
+// ============================================================================
+
+QVector<Role> DbService::getRoles() {
+    QVector<Role> roles;
+    if (!ensureConnected()) return roles;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    if (query.exec("SELECT id, role_name, description, active FROM roles ORDER BY role_name")) {
+        while (query.next()) {
+            roles.append(parseRole(query));
+        }
+    }
+    return roles;
+}
+
+std::optional<Role> DbService::getRole(RoleId roleId) {
+    if (!ensureConnected()) return std::nullopt;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("SELECT id, role_name, description, active FROM roles WHERE id = :id");
+    query.bindValue(":id", roleId);
+    
+    if (query.exec() && query.next()) {
+        return parseRole(query);
+    }
+    return std::nullopt;
+}
+
+bool DbService::createRole(const Role& role) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("INSERT INTO roles (role_name, description, active) VALUES (:name, :desc, :active)");
+    query.bindValue(":name", role.name);
+    query.bindValue(":desc", role.description);
+    query.bindValue(":active", role.active);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+bool DbService::updateRole(const Role& role) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("UPDATE roles SET role_name = :name, description = :desc, active = :active WHERE id = :id");
+    query.bindValue(":name", role.name);
+    query.bindValue(":desc", role.description);
+    query.bindValue(":active", role.active);
+    query.bindValue(":id", role.id);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+bool DbService::deleteRole(RoleId roleId) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("DELETE FROM roles WHERE id = :id");
+    query.bindValue(":id", roleId);
+    
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+QVector<Role> DbService::getUserRoles(UserId userId) {
+    QVector<Role> roles;
+    if (!ensureConnected()) return roles;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("SELECT r.id, r.role_name, r.description, r.active FROM roles r "
+                  "JOIN user_roles ur ON r.id = ur.role_id WHERE ur.user_id = :userId");
+    query.bindValue(":userId", userId);
+    
+    if (query.exec()) {
+        while (query.next()) {
+            roles.append(parseRole(query));
+        }
+    }
+    return roles;
+}
+
+bool DbService::assignRoleToUser(UserId userId, RoleId roleId) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("INSERT INTO user_roles (user_id, role_id) VALUES (:userId, :roleId) "
+                  "ON CONFLICT (user_id, role_id) DO NOTHING");
+    query.bindValue(":userId", userId);
+    query.bindValue(":roleId", roleId);
+    
+    return query.exec();
+}
+
+bool DbService::removeRoleFromUser(UserId userId, RoleId roleId) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("DELETE FROM user_roles WHERE user_id = :userId AND role_id = :roleId");
+    query.bindValue(":userId", userId);
+    query.bindValue(":roleId", roleId);
+    
+    return query.exec() && query.numRowsAffected() > 0;
+}
+
+// ============================================================================
+// Permission Management
+// ============================================================================
+
+QVector<Permission> DbService::getPermissions() {
+    QVector<Permission> perms;
+    if (!ensureConnected()) return perms;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    if (query.exec("SELECT id, permission_name, category, description FROM permissions "
+                   "WHERE active = true ORDER BY category, permission_name")) {
+        while (query.next()) {
+            perms.append(parsePermission(query));
+        }
+    }
+    return perms;
+}
+
+QVector<Permission> DbService::getRolePermissions(RoleId roleId) {
+    QVector<Permission> perms;
+    if (!ensureConnected()) return perms;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("SELECT p.id, p.permission_name, p.category, p.description FROM permissions p "
+                  "JOIN role_permissions rp ON p.id = rp.permission_id "
+                  "WHERE rp.role_id = :roleId AND rp.granted = true AND p.active = true");
+    query.bindValue(":roleId", roleId);
+    
+    if (query.exec()) {
+        while (query.next()) {
+            perms.append(parsePermission(query));
+        }
+    }
+    return perms;
+}
+
+bool DbService::assignPermissionToRole(RoleId roleId, qint32 permissionId) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("INSERT INTO role_permissions (role_id, permission_id, granted) "
+                  "VALUES (:roleId, :permId, true) "
+                  "ON CONFLICT (role_id, permission_id) DO UPDATE SET granted = true");
+    query.bindValue(":roleId", roleId);
+    query.bindValue(":permId", permissionId);
+    
+    return query.exec();
+}
+
+bool DbService::removePermissionFromRole(RoleId roleId, qint32 permissionId) {
+    if (!ensureConnected()) return false;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    query.prepare("DELETE FROM role_permissions WHERE role_id = :roleId AND permission_id = :permId");
+    query.bindValue(":roleId", roleId);
+    query.bindValue(":permId", permissionId);
+    
+    return query.exec() && query.numRowsAffected() > 0;
 }
 
 // ============================================================================
@@ -1446,12 +2075,176 @@ ExportDocument DbService::parseExportDocument(const QSqlQuery& query) {
     return doc;
 }
 
+Product DbService::parseProduct(const QSqlQuery& query) {
+    Product p;
+    p.id = query.value(0).toLongLong();
+    p.gtin = query.value(1).toString();
+    p.name = query.value(2).toString();
+    p.description = query.value(3).toString();
+    p.createdAt = query.value(4).toDateTime();
+    return p;
+}
+
+ProductPackaging DbService::parseProductPackaging(const QSqlQuery& query) {
+    ProductPackaging pp;
+    pp.id = query.value(0).toLongLong();
+    pp.productId = query.value(1).toLongLong();
+    pp.numberOfProducts = query.value(2).toInt();
+    pp.gtin = query.value(3).toString();
+    pp.name = query.value(4).toString();
+    pp.description = query.value(5).toString();
+    pp.createdAt = query.value(6).toDateTime();
+    return pp;
+}
+
 QString DbService::buildPlaceholders(const QStringList& values) {
     QStringList escaped;
     for (const QString& v : values) {
         escaped.append(QString("'%1'").arg(QString(v).replace("'", "''")));
     }
     return escaped.join(", ");
+}
+
+QString DbService::cleanBarcodeForExport(const QString& barcode) {
+    if (barcode.isEmpty()) {
+        return barcode;
+    }
+    
+    // GS1 Group Separator character (0x1D = decimal 29)
+    const QChar gs1Separator(0x1D);
+    
+    // Find the GS1 separator
+    int separatorPos = barcode.indexOf(gs1Separator);
+    
+    if (separatorPos != -1) {
+        // Found GS separator, truncate at this position
+        return barcode.left(separatorPos);
+    }
+    
+    // Fallback: Look for "93" pattern which might indicate AI 93
+    // This handles cases where the separator might not be preserved
+    int ai93Pos = barcode.indexOf("93");
+    if (ai93Pos > 0) {
+        // Make sure this looks like an AI position (not part of the main barcode)
+        // GS1 barcodes typically have the main data first, so AI 93 should be near the end
+        // Check if there's enough data before "93" (at least 20 chars for a typical GTIN+serial)
+        if (ai93Pos >= 20) {
+            // Check if the character before "93" might be a separator we can't see
+            // or if "93" is at a logical break point
+            return barcode.left(ai93Pos);
+        }
+    }
+    
+    // No separator found, return original barcode
+    return barcode;
+}
+
+QString DbService::generateBoxExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db) {
+    QString xml;
+    xml += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+    xml += "<unit_pack>\n";
+    xml += "  <Document>\n";
+    xml += "    <organisation>\n";
+    xml += "      <id_info>\n";
+    xml += QString("        <LP_info LP_TIN=\"%1\" />\n").arg(lpTin);
+    xml += "      </id_info>\n";
+    xml += "    </organisation>\n";
+    
+    // Get all boxes for this export
+    QSqlQuery boxQuery(db);
+    boxQuery.prepare("SELECT bar_code FROM export_boxes WHERE document_id = :docId ORDER BY created_at");
+    boxQuery.bindValue(":docId", docId);
+    
+    if (!boxQuery.exec()) {
+        qDebug() << "Failed to query export boxes:" << boxQuery.lastError().text();
+        return xml;
+    }
+    
+    while (boxQuery.next()) {
+        QString boxBarcode = cleanBarcodeForExport(boxQuery.value(0).toString());
+        xml += "    <pack_content>\n";
+        xml += QString("      <pack_code><![CDATA[%1]]></pack_code>\n").arg(boxBarcode);
+        
+        // Get items for this box
+        QSqlQuery itemQuery(db);
+        itemQuery.prepare(
+            "SELECT ei.bar_code FROM export_items ei "
+            "JOIN item_box_assignments iba ON ei.bar_code = (SELECT bar_code FROM items WHERE id = iba.item_id) "
+            "JOIN boxes b ON iba.box_id = b.id "
+            "WHERE b.bar_code = :boxBarcode AND ei.document_id = :docId "
+            "ORDER BY ei.created_at"
+        );
+        itemQuery.bindValue(":boxBarcode", boxQuery.value(0).toString()); // Use original barcode for query
+        itemQuery.bindValue(":docId", docId);
+        
+        if (itemQuery.exec()) {
+            while (itemQuery.next()) {
+                QString itemBarcode = cleanBarcodeForExport(itemQuery.value(0).toString());
+                xml += QString("      <cis><![CDATA[%1]]></cis>\n").arg(itemBarcode);
+            }
+        }
+        
+        xml += "    </pack_content>\n";
+    }
+    
+    xml += "  </Document>\n";
+    xml += "</unit_pack>\n";
+    
+    return xml;
+}
+
+QString DbService::generatePalletExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db) {
+    QString xml;
+    xml += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+    xml += "<aggregation_document>\n";
+    xml += "  <Document>\n";
+    xml += "    <organisation>\n";
+    xml += "      <id_info>\n";
+    xml += QString("        <LP_info LP_TIN=\"%1\" />\n").arg(lpTin);
+    xml += "      </id_info>\n";
+    xml += "    </organisation>\n";
+    
+    // Get all pallets for this export
+    QSqlQuery palletQuery(db);
+    palletQuery.prepare("SELECT bar_code FROM export_pallets WHERE document_id = :docId ORDER BY created_at");
+    palletQuery.bindValue(":docId", docId);
+    
+    if (!palletQuery.exec()) {
+        qDebug() << "Failed to query export pallets:" << palletQuery.lastError().text();
+        return xml;
+    }
+    
+    while (palletQuery.next()) {
+        QString palletBarcode = cleanBarcodeForExport(palletQuery.value(0).toString());
+        xml += "    <aggregation_unit>\n";
+        xml += QString("      <sscc><![CDATA[%1]]></sscc>\n").arg(palletBarcode);
+        
+        // Get boxes on this pallet
+        QSqlQuery boxQuery(db);
+        boxQuery.prepare(
+            "SELECT eb.bar_code FROM export_boxes eb "
+            "JOIN pallet_box_assignments pba ON eb.bar_code = (SELECT bar_code FROM boxes WHERE id = pba.box_id) "
+            "JOIN pallets p ON pba.pallet_id = p.id "
+            "WHERE p.bar_code = :palletBarcode AND eb.document_id = :docId "
+            "ORDER BY eb.created_at"
+        );
+        boxQuery.bindValue(":palletBarcode", palletQuery.value(0).toString()); // Use original barcode for query
+        boxQuery.bindValue(":docId", docId);
+        
+        if (boxQuery.exec()) {
+            while (boxQuery.next()) {
+                QString boxBarcode = cleanBarcodeForExport(boxQuery.value(0).toString());
+                xml += QString("      <unit_pack><![CDATA[%1]]></unit_pack>\n").arg(boxBarcode);
+            }
+        }
+        
+        xml += "    </aggregation_unit>\n";
+    }
+    
+    xml += "  </Document>\n";
+    xml += "</aggregation_document>\n";
+    
+    return xml;
 }
 
 } // namespace core

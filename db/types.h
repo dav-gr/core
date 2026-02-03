@@ -19,6 +19,8 @@ using BoxId = qint64;
 using PalletId = qint64;
 using ProductionLineId = qint64;
 using ExportDocumentId = qint64;
+using ProductId = qint64;
+using ProductPackagingId = qint64;
 
 // ============================================================================
 // Enums
@@ -129,6 +131,24 @@ struct AuthenticatedUser {
 struct ProductionLine {
     ProductionLineId id = 0;
     QString name;
+    QDateTime createdAt;
+};
+
+struct Product {
+    ProductId id = 0;
+    QString gtin;
+    QString name;
+    QString description;
+    QDateTime createdAt;
+};
+
+struct ProductPackaging {
+    ProductPackagingId id = 0;
+    ProductId productId = 0;
+    int numberOfProducts = 0;
+    QString gtin;
+    QString name;
+    QString description;
     QDateTime createdAt;
 };
 
