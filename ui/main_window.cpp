@@ -237,14 +237,29 @@ void MainWindow::onConfig() {
 void MainWindow::onAbout() {
     QMessageBox::about(this, "About BackOffice",
         "<h2>BackOffice Application v2.0</h2>"
-        "<p>Simplified architecture using Qt " QT_VERSION_STR "</p>"
-        "<p>Features:</p>"
+        "<p>BackOffice is a simple, user-friendly administration application for managing production and post-production operations. "
+        "It helps accountants and administrators import and export production data, define products and packaging, and manage user access - all from one central interface.</p>"
+        "<p><b>Key features</b></p>"
         "<ul>"
-        "<li>PostgreSQL database integration</li>"
-        "<li>Import/Export of Items, Boxes, Pallets</li>"
-        "<li>User authentication with PIN</li>"
+        "<li>Import and export production data (items, boxes, pallets)</li>"
+        "<li>Maintain product master data (GTINs, names, descriptions)</li>"
+        "<li>Configure product packaging (e.g., 6x 0.5L packs)</li>"
+        "<li>Manage users, roles, and permissions</li>"
         "</ul>"
-        "<p>Built with Qt and C++17</p>");
+        "<p><b>Who should use it</b></p>"
+        "<ul>"
+        "<li>Administrators: full access to configuration and user management</li>"
+        "<li>Accountants: import/export and production-data management</li>"
+        "<li>Production staff: use designated production apps; BackOffice is for administrative tasks</li>"
+        "</ul>"
+        "<p><b>Getting started</b></p>"
+        "<ol>"
+        "<li>Log in with your BackOffice credentials.</li>"
+        "<li>Use the Import tab to load production files.</li>"
+        "<li>Use Production Data to add products and packaging.</li>"
+        "<li>Use Administration to manage users, roles and permissions.</li>"
+        "</ol>"
+        "<p>Need help? Contact your system administrator or refer to the Admin Guide in the docs folder for step-by-step instructions and troubleshooting.</p>");
 }
 
 void MainWindow::onConnectionLost() {
