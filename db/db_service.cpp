@@ -4,6 +4,7 @@
 #include <QSqlRecord>
 #include <QFile>
 #include <QTextStream>
+#include <QRegularExpression>
 #include <QUuid>
 #include <QtConcurrent>
 #include <QDebug>
@@ -370,25 +371,29 @@ ImportResult DbService::doImport(const QString& filePath, ProductionLineId lineI
                                const QString& tableName) {
 ImportResult result;
     
-// Read CSV file
+// Read CSV file with explicit UTF-8 encoding to preserve GS1 control characters
 QFile file(filePath);
-if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+if (!file.open(QIODevice::ReadOnly)) {  // Don't use QIODevice::Text
     result.errors.append("Cannot open file: " + filePath);
     return result;
 }
-    
-QTextStream in(&file);
-QStringList barcodes;
-    
-    // Read barcodes - CSV files have NO header, each line is a complete barcode
-    while (!in.atEnd()) {
-        QString line = in.readLine().trimmed();
-        if (!line.isEmpty()) {
-            // Each line is a complete barcode (no comma separator)
-            barcodes.append(line);
-        }
-    }
+
+// Read as raw bytes, then decode as UTF-8 explicitly
+QByteArray rawData = file.readAll();
 file.close();
+
+QString content = QString::fromUtf8(rawData);
+
+// Split into lines (handle both Unix \n and Windows \r\n)
+QStringList lines = content.split(QRegularExpression("\\r?\\n"), Qt::SkipEmptyParts);
+
+QStringList barcodes;
+for (const QString& line : lines) {
+    QString barcode = line.trimmed();
+    if (!barcode.isEmpty()) {
+        barcodes.append(barcode);
+    }
+}
     
 result.totalRecords = barcodes.size();
     
