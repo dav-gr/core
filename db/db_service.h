@@ -166,7 +166,11 @@ public:
                                         ProductionLineId lineId = 0,
                                         int limit = 100);
     bool completePallet(PalletId id);
-    int getPalletBoxCount(PalletId id);
+
+    QVector<Pallet> getPallets();
+    bool createPallet(const Pallet& pallet);
+    bool updatePallet(const Pallet& pallet);
+    bool deletePallet(PalletId id);
 
     // =========================================================================
     // Export Operations (ASYNC)

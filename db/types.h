@@ -179,6 +179,8 @@ struct Pallet {
     QString barcode;
     PalletStatus status = PalletStatus::New;
     ProductionLineId productionLine = 0;
+    ProductPackagingId packageId = 0;
+    int packageCount = 0;
     QDateTime createdAt;
     // Note: Schema does not have completed_at column
     

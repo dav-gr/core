@@ -399,7 +399,7 @@ if (barcodes.isEmpty()) {
     
 // Create thread-local database connection for async operation
 QString dbHost, dbDatabase, dbUser, dbPassword;
-int dbPort;
+int dbPort = 5432;
 {
     QMutexLocker locker(&mutex_);
     dbHost = config_.host;
@@ -415,7 +415,7 @@ QSqlDatabase db = createThreadLocalConnection(dbHost, dbPort,
 if (!db.isOpen()) {
     result.errors.append("Failed to create database connection: Driver not loaded or connection failed");
     return result;
-}
+ }
     
     QString timestampCol = (tableName == "pallets") ? "created_at" : "imported_at";
     
@@ -909,7 +909,7 @@ std::optional<Pallet> DbService::getPallet(PalletId id) {
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
     query.prepare(
-        "SELECT id, bar_code, status, production_line, created_at "
+        "SELECT id, bar_code, status, production_line, package_id, package_count, created_at "
         "FROM pallets WHERE id = :id"
     );
     query.bindValue(":id", id);
@@ -919,6 +919,22 @@ std::optional<Pallet> DbService::getPallet(PalletId id) {
     }
     
     return std::nullopt;
+}
+
+QVector<Pallet> DbService::getPallets() {
+    QVector<Pallet> pallets;
+    if (!ensureConnected()) return pallets;
+
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+
+    if (query.exec("SELECT id, bar_code, status, production_line, package_id, package_count, created_at FROM pallets ORDER BY created_at DESC")) {
+        while (query.next()) {
+            pallets.append(parsePallet(query));
+        }
+    }
+
+    return pallets;
 }
 
 QVector<Pallet> DbService::getPalletsByStatus(PalletStatus status, ProductionLineId lineId,
@@ -931,7 +947,7 @@ QVector<Pallet> DbService::getPalletsByStatus(PalletStatus status, ProductionLin
     QSqlQuery query(db);
     
     QString sql = 
-        "SELECT id, bar_code, status, production_line, created_at "
+        "SELECT id, bar_code, status, production_line, package_id, package_count, created_at "
         "FROM pallets WHERE status = :status";
     
     if (lineId > 0) {
@@ -955,51 +971,69 @@ QVector<Pallet> DbService::getPalletsByStatus(PalletStatus status, ProductionLin
     return pallets;
 }
 
-bool DbService::completePallet(PalletId id) {
+bool DbService::createPallet(const Pallet& pallet) {
     if (!ensureConnected()) return false;
-    
+
     QSqlDatabase db = getDatabase();
-    
-    QSqlQuery countQuery(db);
-    countQuery.prepare(
-        "SELECT COUNT(*) FROM pallet_box_assignments pba "
-        "JOIN pallets p ON pba.pallet_id = p.id WHERE p.id = :id"
-    );
-    countQuery.bindValue(":id", id);
-    
-    if (!countQuery.exec() || !countQuery.next() || countQuery.value(0).toInt() == 0) {
+    QSqlQuery query(db);
+
+    query.prepare("INSERT INTO pallets (bar_code, status, production_line, package_id, package_count, created_at) "
+                  "VALUES (:barcode, :status, :lineId, :packageId, :packageCount, NOW())");
+    query.bindValue(":barcode", pallet.barcode);
+    query.bindValue(":status", static_cast<int>(pallet.status));
+    query.bindValue(":lineId", pallet.productionLine);
+    query.bindValue(":packageId", pallet.packageId == 0 ? QVariant() : QVariant::fromValue(pallet.packageId));
+    query.bindValue(":packageCount", pallet.packageCount);
+
+    if (!query.exec()) {
         QMutexLocker locker(&mutex_);
-        lastError_ = "Pallet has no boxes";
+        lastError_ = query.lastError().text();
         return false;
     }
-    
-    QSqlQuery query(db);
-    query.prepare(
-        "UPDATE pallets SET status = 1 "
-        "WHERE id = :id AND status = 0"
-    );
-    query.bindValue(":id", id);
-    
-    return query.exec() && query.numRowsAffected() > 0;
+
+    return true;
 }
 
-int DbService::getPalletBoxCount(PalletId id) {
-    if (!ensureConnected()) return 0;
-    
+bool DbService::updatePallet(const Pallet& pallet) {
+    if (!ensureConnected()) return false;
+
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
-    
-    query.prepare(
-        "SELECT COUNT(*) FROM pallet_box_assignments pba "
-        "JOIN pallets p ON pba.pallet_id = p.id WHERE p.id = :id"
-    );
-    query.bindValue(":id", id);
-    
-    if (query.exec() && query.next()) {
-        return query.value(0).toInt();
+
+    query.prepare("UPDATE pallets SET bar_code = :barcode, status = :status, production_line = :lineId, "
+                  "package_id = :packageId, package_count = :packageCount WHERE id = :id");
+    query.bindValue(":barcode", pallet.barcode);
+    query.bindValue(":status", static_cast<int>(pallet.status));
+    query.bindValue(":lineId", pallet.productionLine);
+    query.bindValue(":packageId", pallet.packageId == 0 ? QVariant() : QVariant::fromValue(pallet.packageId));
+    query.bindValue(":packageCount", pallet.packageCount);
+    query.bindValue(":id", pallet.id);
+
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
     }
-    
-    return 0;
+
+    return query.numRowsAffected() > 0;
+}
+
+bool DbService::deletePallet(PalletId id) {
+    if (!ensureConnected()) return false;
+
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+
+    query.prepare("DELETE FROM pallets WHERE id = :id");
+    query.bindValue(":id", id);
+
+    if (!query.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+        return false;
+    }
+
+    return query.numRowsAffected() > 0;
 }
 
 // ============================================================================
@@ -2059,7 +2093,9 @@ Pallet DbService::parsePallet(const QSqlQuery& query) {
     pallet.barcode = query.value(1).toString();
     pallet.status = static_cast<PalletStatus>(query.value(2).toInt());
     pallet.productionLine = query.value(3).toLongLong();
-    pallet.createdAt = query.value(4).toDateTime();
+    pallet.packageId = query.value(4).toLongLong();
+    pallet.packageCount = query.value(5).toInt();
+    pallet.createdAt = query.value(6).toDateTime();
     // Note: Schema does not have completed_at column
     return pallet;
 }
