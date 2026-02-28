@@ -172,6 +172,12 @@ public:
     bool updatePallet(const Pallet& pallet);
     bool deletePallet(PalletId id);
 
+    // PackagePallet operations (CRUD for package_pallet table)
+    bool createPackagePallet(const PackagePallet& packagePallet);
+    bool updatePackagePallet(const PackagePallet& packagePallet);
+    bool deletePackagePallet(PackagePalletId id);
+    QVector<PackagePallet> getPackagePallets(int limit = 100, int offset = 0);
+
     // =========================================================================
     // Export Operations (ASYNC)
     // =========================================================================
@@ -228,6 +234,7 @@ private:
     ExportDocument parseExportDocument(const QSqlQuery& query);
     Product parseProduct(const QSqlQuery& query);
     ProductPackaging parseProductPackaging(const QSqlQuery& query);
+    PackagePallet parsePackagePallet(const QSqlQuery& query);
     
     QString buildPlaceholders(const QStringList& values);
 

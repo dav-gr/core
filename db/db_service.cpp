@@ -971,14 +971,136 @@ QVector<Pallet> DbService::getPalletsByStatus(PalletStatus status, ProductionLin
     return pallets;
 }
 
+bool DbService::createPackagePallet(const PackagePallet& packagePallet) {
+    if (!ensureConnected()) return false;
+    QSqlDatabase db = getDatabase();
+
+    QSqlQuery createTbl(db);
+    const QString createSql =
+        "CREATE TABLE IF NOT EXISTS package_pallet ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "product_packaging_id BIGINT, "
+        "number_of_products INT, "
+        "gtin TEXT, "
+        "name TEXT, "
+        "description TEXT, "
+        "created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(), "
+        "FOREIGN KEY (product_packaging_id) REFERENCES product_packaging(id) ON DELETE CASCADE"
+        ")";
+    if (!createTbl.exec(createSql)) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = createTbl.lastError().text();
+        return false;
+    }
+
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO package_pallet (product_packaging_id, number_of_products, gtin, name, description) VALUES (:prodId, :num, :gtin, :name, :desc)");
+    q.bindValue(":prodId", packagePallet.productPackagingId);
+    q.bindValue(":num", packagePallet.numberOfProducts);
+    q.bindValue(":gtin", packagePallet.gtin);
+    q.bindValue(":name", packagePallet.name);
+    q.bindValue(":desc", packagePallet.description);
+
+    if (!q.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+bool DbService::updatePackagePallet(const PackagePallet& packagePallet) {
+    if (!ensureConnected()) return false;
+    QSqlDatabase db = getDatabase();
+    QSqlQuery q(db);
+    q.prepare("UPDATE package_pallet SET product_packaging_id = :prodId, number_of_products = :num, gtin = :gtin, name = :name, description = :desc WHERE id = :id");
+    q.bindValue(":prodId", packagePallet.productPackagingId);
+    q.bindValue(":num", packagePallet.numberOfProducts);
+    q.bindValue(":gtin", packagePallet.gtin);
+    q.bindValue(":name", packagePallet.name);
+    q.bindValue(":desc", packagePallet.description);
+    q.bindValue(":id", packagePallet.id);
+
+    if (!q.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
+bool DbService::deletePackagePallet(PackagePalletId id) {
+    if (!ensureConnected()) return false;
+    QSqlDatabase db = getDatabase();
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM package_pallet WHERE id = :id");
+    q.bindValue(":id", id);
+    if (!q.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
 bool DbService::createPallet(const Pallet& pallet) {
     if (!ensureConnected()) return false;
 
     QSqlDatabase db = getDatabase();
-    QSqlQuery query(db);
+    db.transaction();
 
-    query.prepare("INSERT INTO pallets (bar_code, status, production_line, package_id, package_count, created_at) "
-                  "VALUES (:barcode, :status, :lineId, :packageId, :packageCount, NOW())");
+    // Ensure pallets table exists
+    QSqlQuery createPalletTbl(db);
+    const QString createPalletsSql =
+        "CREATE TABLE IF NOT EXISTS pallets ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "bar_code TEXT, "
+        "status INT, "
+        "production_line BIGINT, "
+        "package_id BIGINT, "
+        "package_count INT, "
+        "created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(), "
+        "FOREIGN KEY (package_id) REFERENCES product_packaging(id) ON DELETE SET NULL"
+        ")";
+    if (!createPalletTbl.exec(createPalletsSql)) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = createPalletTbl.lastError().text();
+        return false;
+    }
+
+    // If a product packaging is associated, create a package_pallet snapshot
+    if (pallet.packageId != 0) {
+        QSqlQuery pkgQuery(db);
+        pkgQuery.prepare("SELECT number_of_products, gtin, name, description FROM product_packaging WHERE id = :id");
+        pkgQuery.bindValue(":id", pallet.packageId);
+        QString gtin, name, desc;
+        int numProducts = pallet.packageCount;
+        if (pkgQuery.exec() && pkgQuery.next()) {
+            if (!pkgQuery.value(0).isNull()) numProducts = pkgQuery.value(0).toInt();
+            gtin = pkgQuery.value(1).toString();
+            name = pkgQuery.value(2).toString();
+            desc = pkgQuery.value(3).toString();
+        }
+
+        QSqlQuery insertPkg(db);
+        insertPkg.prepare("INSERT INTO package_pallet (product_packaging_id, number_of_products, gtin, name, description, created_at) VALUES (:prodId, :num, :gtin, :name, :desc, NOW()) RETURNING id");
+        insertPkg.bindValue(":prodId", pallet.packageId);
+        insertPkg.bindValue(":num", numProducts);
+        insertPkg.bindValue(":gtin", gtin.isEmpty() ? QVariant() : gtin);
+        insertPkg.bindValue(":name", name.isEmpty() ? QVariant() : name);
+        insertPkg.bindValue(":desc", desc.isEmpty() ? QVariant() : desc);
+
+        if (!insertPkg.exec() || !insertPkg.next()) {
+            db.rollback();
+            QMutexLocker locker(&mutex_);
+            lastError_ = insertPkg.lastError().text();
+            return false;
+        }
+    }
+
+    QSqlQuery query(db);
+    query.prepare("INSERT INTO pallets (bar_code, status, production_line, package_id, package_count, created_at) VALUES (:barcode, :status, :lineId, :packageId, :packageCount, NOW())");
     query.bindValue(":barcode", pallet.barcode);
     query.bindValue(":status", static_cast<int>(pallet.status));
     query.bindValue(":lineId", pallet.productionLine);
@@ -986,22 +1108,21 @@ bool DbService::createPallet(const Pallet& pallet) {
     query.bindValue(":packageCount", pallet.packageCount);
 
     if (!query.exec()) {
+        db.rollback();
         QMutexLocker locker(&mutex_);
         lastError_ = query.lastError().text();
         return false;
     }
 
+    db.commit();
     return true;
 }
 
 bool DbService::updatePallet(const Pallet& pallet) {
     if (!ensureConnected()) return false;
-
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
-
-    query.prepare("UPDATE pallets SET bar_code = :barcode, status = :status, production_line = :lineId, "
-                  "package_id = :packageId, package_count = :packageCount WHERE id = :id");
+    query.prepare("UPDATE pallets SET bar_code = :barcode, status = :status, production_line = :lineId, package_id = :packageId, package_count = :packageCount WHERE id = :id");
     query.bindValue(":barcode", pallet.barcode);
     query.bindValue(":status", static_cast<int>(pallet.status));
     query.bindValue(":lineId", pallet.productionLine);
@@ -1014,26 +1135,21 @@ bool DbService::updatePallet(const Pallet& pallet) {
         lastError_ = query.lastError().text();
         return false;
     }
-
     return query.numRowsAffected() > 0;
 }
 
 bool DbService::deletePallet(PalletId id) {
     if (!ensureConnected()) return false;
-
     QSqlDatabase db = getDatabase();
-    QSqlQuery query(db);
-
-    query.prepare("DELETE FROM pallets WHERE id = :id");
-    query.bindValue(":id", id);
-
-    if (!query.exec()) {
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM pallets WHERE id = :id");
+    q.bindValue(":id", id);
+    if (!q.exec()) {
         QMutexLocker locker(&mutex_);
-        lastError_ = query.lastError().text();
+        lastError_ = q.lastError().text();
         return false;
     }
-
-    return query.numRowsAffected() > 0;
+    return q.numRowsAffected() > 0;
 }
 
 // ============================================================================
@@ -1290,7 +1406,7 @@ ExportResult DbService::doExportPallets(const QVector<PalletId>& palletIds, cons
     }
     result.palletsExported = snapshotQuery.numRowsAffected();
     
-    // Snapshot boxes on these pallets
+    // Snapshot boxes on this pallet
     QString boxSnapshotSql = QString(
         "INSERT INTO export_boxes (document_id, bar_code, created_at) "
         "SELECT %1, b.bar_code, NOW() "
@@ -1579,15 +1695,34 @@ std::optional<Product> DbService::getProduct(ProductId id) {
 
 bool DbService::createProduct(const Product& product) {
     if (!ensureConnected()) return false;
-    
+
     QSqlDatabase db = getDatabase();
+
+    // Ensure products table and index exist
+    QSqlQuery createQuery(db);
+    const QString createProductsSql =
+        "CREATE TABLE IF NOT EXISTS products ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "gtin TEXT, "
+        "name TEXT, "
+        "description TEXT, "
+        "created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()"
+        ")";
+    if (!createQuery.exec(createProductsSql)) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = createQuery.lastError().text();
+        return false;
+    }
+    // Index on GTIN
+    QSqlQuery idxQuery(db);
+    idxQuery.exec("CREATE INDEX IF NOT EXISTS idx_products_gtin ON products (gtin)");
+
     QSqlQuery query(db);
-    
     query.prepare("INSERT INTO products (gtin, name, description) VALUES (:gtin, :name, :desc)");
     query.bindValue(":gtin", product.gtin);
     query.bindValue(":name", product.name);
     query.bindValue(":desc", product.description);
-    
+
     if (!query.exec()) {
         QMutexLocker locker(&mutex_);
         lastError_ = query.lastError().text();
@@ -1671,10 +1806,32 @@ std::optional<ProductPackaging> DbService::getPackaging(ProductPackagingId id) {
 
 bool DbService::createPackaging(const ProductPackaging& pkg) {
     if (!ensureConnected()) return false;
-    
+
     QSqlDatabase db = getDatabase();
+
+    // Ensure product_packaging table exists with foreign key to products
+    QSqlQuery createQuery(db);
+    const QString createPackagingSql =
+        "CREATE TABLE IF NOT EXISTS product_packaging ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "product_id BIGINT, "
+        "number_of_products INT, "
+        "gtin TEXT, "
+        "name TEXT, "
+        "description TEXT, "
+        "created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(), "
+        "FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE"
+        ")";
+    if (!createQuery.exec(createPackagingSql)) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = createQuery.lastError().text();
+        return false;
+    }
+    // Index on GTIN
+    QSqlQuery idxQuery(db);
+    idxQuery.exec("CREATE INDEX IF NOT EXISTS idx_product_packaging_gtin ON product_packaging (gtin)");
+
     QSqlQuery query(db);
-    
     query.prepare("INSERT INTO product_packaging (product_id, number_of_products, gtin, name, description) "
                   "VALUES (:productId, :num, :gtin, :name, :desc)");
     query.bindValue(":productId", pkg.productId);
@@ -1682,7 +1839,7 @@ bool DbService::createPackaging(const ProductPackaging& pkg) {
     query.bindValue(":gtin", pkg.gtin);
     query.bindValue(":name", pkg.name);
     query.bindValue(":desc", pkg.description);
-    
+
     if (!query.exec()) {
         QMutexLocker locker(&mutex_);
         lastError_ = query.lastError().text();
@@ -1777,10 +1934,10 @@ bool DbService::createUser(const User& user) {
 
 bool DbService::updateUser(const User& user) {
     if (!ensureConnected()) return false;
-    
+
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
-    
+
     query.prepare("UPDATE users SET username = :username, pin_hash = :pinHash, full_name = :fullName, "
                   "email = :email, phone_number = :phone, active = :active, superuser = :superuser "
                   "WHERE id = :id");
@@ -1792,7 +1949,7 @@ bool DbService::updateUser(const User& user) {
     query.bindValue(":active", user.active);
     query.bindValue(":superuser", user.superuser);
     query.bindValue(":id", user.id);
-    
+
     if (!query.exec()) {
         QMutexLocker locker(&mutex_);
         lastError_ = query.lastError().text();
@@ -2131,6 +2288,40 @@ ProductPackaging DbService::parseProductPackaging(const QSqlQuery& query) {
     pp.description = query.value(5).toString();
     pp.createdAt = query.value(6).toDateTime();
     return pp;
+}
+
+// Parse helper for PackagePallet (snapshot rows)
+PackagePallet DbService::parsePackagePallet(const QSqlQuery& query) {
+    PackagePallet p;
+    // columns: id, product_packaging_id, number_of_products, gtin, name, description, created_at
+    p.id = query.value(0).toLongLong();
+    p.productPackagingId = query.value(1).toLongLong();
+    p.numberOfProducts = query.value(2).toInt();
+    p.gtin = query.value(3).toString();
+    p.name = query.value(4).toString();
+    p.description = query.value(5).toString();
+    p.createdAt = query.value(6).toDateTime();
+    return p;
+}
+
+QVector<PackagePallet> DbService::getPackagePallets(int limit, int offset) {
+    QVector<PackagePallet> res;
+    if (!ensureConnected()) return res;
+
+    QSqlDatabase db = getDatabase();
+    QSqlQuery q(db);
+    q.prepare("SELECT id, product_packaging_id, number_of_products, gtin, name, description, created_at FROM package_pallet ORDER BY created_at DESC LIMIT :limit OFFSET :offset");
+    q.bindValue(":limit", limit);
+    q.bindValue(":offset", offset);
+    if (!q.exec()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = q.lastError().text();
+        return res;
+    }
+    while (q.next()) {
+        res.append(parsePackagePallet(q));
+    }
+    return res;
 }
 
 QString DbService::buildPlaceholders(const QStringList& values) {
