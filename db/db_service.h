@@ -11,22 +11,6 @@
 
 namespace core {
 
-/**
- * @brief Single database service for all database operations
- * 
- * Design:
- * - SYNC for fast queries (<100ms): auth, getItem, stats
- * - ASYNC for slow operations: imports, exports
- * - Uses Qt's QSqlDatabase with PostgreSQL driver (QPSQL)
- * - Thread-safe via QMutex
- * 
- * Usage:
- *   DbService db;
- *   if (db.connect(config)) {
- *       auto user = db.authenticate(pinHash);
- *       auto stats = db.getStats();
- *   }
- */
 class DbService : public QObject {
     Q_OBJECT
 
@@ -143,6 +127,7 @@ public:
     int countScannedItemsNotInBox(ProductionLineId lineId = 0);
     bool assignItemToBox(ItemId itemId, BoxId boxId);
     int assignItemsToBox(const QVector<ItemId>& itemIds, BoxId boxId);
+    QVector<Item> getScannedItemsNotInBox(ProductionLineId lineId = 0, int limit = 1000);
 
     // =========================================================================
     // Box Operations (SYNC)
@@ -168,7 +153,17 @@ public:
                                         ProductionLineId lineId = 0,
                                         int limit = 100);
     bool completePallet(PalletId id);
-    int getPalletBoxCount(PalletId id);
+
+    QVector<Pallet> getPallets();
+    bool createPallet(const Pallet& pallet);
+    bool updatePallet(const Pallet& pallet);
+    bool deletePallet(PalletId id);
+
+    // PackagePallet operations (CRUD for package_pallet table)
+    bool createPackagePallet(const PackagePallet& packagePallet);
+    bool updatePackagePallet(const PackagePallet& packagePallet);
+    bool deletePackagePallet(PackagePalletId id);
+    QVector<PackagePallet> getPackagePallets(int limit = 100, int offset = 0);
 
     // =========================================================================
     // Export Operations (ASYNC)
@@ -180,7 +175,12 @@ public:
                                             const QString& lpTin);
     QFuture<ExportResult> exportPalletsAsync(const QVector<PalletId>& palletIds,
                                               const QString& lpTin);
-    
+    QFuture<ExportResult> exportItemsAsync(const QVector<ItemId>& itemIds,
+                                           const QString& lpTin);
+    // Export scanned (not in box) items by fetching them from DB
+    QFuture<ExportResult> exportItemsAsync(ProductionLineId lineId, int limit, const QString& lpTin);
+    QFuture<ExportResult> exportItemsAsync(int limit, const QString& lpTin);
+
     std::optional<ExportDocument> getExportDocument(ExportDocumentId id);
     QVector<ExportDocument> getExportDocuments(int limit = 50, int offset = 0);
     int getExportDocumentItemCount(ExportDocumentId id);
@@ -230,6 +230,7 @@ QString cleanBarcodeForExport(const QString& barcode);
     ExportDocument parseExportDocument(const QSqlQuery& query);
     Product parseProduct(const QSqlQuery& query);
     ProductPackaging parseProductPackaging(const QSqlQuery& query);
+    PackagePallet parsePackagePallet(const QSqlQuery& query);
     
     QString buildPlaceholders(const QStringList& values);
 

@@ -21,6 +21,7 @@ using ProductionLineId = qint64;
 using ExportDocumentId = qint64;
 using ProductId = qint64;
 using ProductPackagingId = qint64;
+using PackagePalletId = qint64;
 
 // ============================================================================
 // Enums
@@ -153,6 +154,16 @@ struct ProductPackaging {
     QDateTime createdAt;
 };
 
+struct PackagePallet {
+    PackagePalletId id = 0;
+    ProductPackagingId productPackagingId = 0;
+    int numberOfProducts = 0;
+    QString gtin;
+    QString name;
+    QString description;
+    QDateTime createdAt;
+};
+
 struct Item {
     ItemId id = 0;
     QString barcode;
@@ -180,6 +191,8 @@ struct Pallet {
     QString barcode;
     PalletStatus status = PalletStatus::New;
     ProductionLineId productionLine = 0;
+    ProductPackagingId packageId = 0;
+    int packageCount = 0;
     QDateTime createdAt;
     // Note: Schema does not have completed_at column
     
