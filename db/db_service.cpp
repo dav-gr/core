@@ -4,6 +4,7 @@
 #include <QSqlRecord>
 #include <QFile>
 #include <QTextStream>
+#include <QRegularExpression>
 #include <QUuid>
 #include <QtConcurrent>
 #include <QDebug>
@@ -370,25 +371,29 @@ ImportResult DbService::doImport(const QString& filePath, ProductionLineId lineI
                                const QString& tableName) {
 ImportResult result;
     
-// Read CSV file
+// Read CSV file with explicit UTF-8 encoding to preserve GS1 control characters
 QFile file(filePath);
-if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+if (!file.open(QIODevice::ReadOnly)) {  // Don't use QIODevice::Text
     result.errors.append("Cannot open file: " + filePath);
     return result;
 }
-    
-QTextStream in(&file);
-QStringList barcodes;
-    
-    // Read barcodes - CSV files have NO header, each line is a complete barcode
-    while (!in.atEnd()) {
-        QString line = in.readLine().trimmed();
-        if (!line.isEmpty()) {
-            // Each line is a complete barcode (no comma separator)
-            barcodes.append(line);
-        }
-    }
+
+// Read as raw bytes, then decode as UTF-8 explicitly
+QByteArray rawData = file.readAll();
 file.close();
+
+QString content = QString::fromUtf8(rawData);
+
+// Split into lines (handle both Unix \n and Windows \r\n)
+QStringList lines = content.split(QRegularExpression("\\r?\\n"), Qt::SkipEmptyParts);
+
+QStringList barcodes;
+for (const QString& line : lines) {
+    QString barcode = line.trimmed();
+    if (!barcode.isEmpty()) {
+        barcodes.append(barcode);
+    }
+}
     
 result.totalRecords = barcodes.size();
     
@@ -554,8 +559,68 @@ QVector<Item> DbService::getItemsInBox(BoxId boxId) {
 
 QVector<Item> DbService::getScannedItemsNotInBox(ProductionLineId lineId, int limit) {
     QVector<Item> items;
+    
     if (!ensureConnected()) return items;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    QString sql = 
+        "SELECT i.id, i.bar_code, i.status, i.production_line, i.imported_at, i.scanned_at "
+        "FROM items i "
+        "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
+        "WHERE i.status = 1 AND iba.item_id IS NULL";
+    
+    if (lineId > 0) {
+        sql += " AND i.production_line = :lineId";
+    }
+    sql += " ORDER BY i.scanned_at LIMIT :limit";
+    
+    query.prepare(sql);
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    query.bindValue(":limit", limit);
+    
+    if (query.exec()) {
+        while (query.next()) {
+            items.append(parseItem(query));
+        }
+    }
+    
+    return items;
+}
 
+int DbService::countScannedItemsNotInBox(ProductionLineId lineId) {
+    if (!ensureConnected()) return 0;
+    
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+    
+    QString sql = 
+        "SELECT COUNT(*) FROM items i "
+        "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
+        "WHERE i.status = 1 AND iba.item_id IS NULL";
+    
+    if (lineId > 0) {
+        sql += " AND i.production_line = :lineId";
+    }
+    
+    query.prepare(sql);
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    
+    return 0;
+}
+
+bool DbService::assignItemToBox(ItemId itemId, BoxId boxId) {
+    if (!ensureConnected()) return false;
+    
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
 
@@ -1104,6 +1169,13 @@ bool DbService::deletePallet(PalletId id) {
 // Export Operations
 // ============================================================================
 
+QFuture<ExportResult> DbService::exportItemsAsync(const QVector<ItemId>& itemIds,
+                                                   const QString& lpTin) {
+    return QtConcurrent::run([this, itemIds, lpTin]() {
+        return doExportItems(itemIds, lpTin);
+    });
+}
+
 QFuture<ExportResult> DbService::exportBoxesAsync(const QVector<BoxId>& boxIds,
                                                    const QString& lpTin) {
     return QtConcurrent::run([this, boxIds, lpTin]() {
@@ -1118,34 +1190,15 @@ QFuture<ExportResult> DbService::exportPalletsAsync(const QVector<PalletId>& pal
     });
 }
 
-QFuture<ExportResult> DbService::exportItemsAsync(const QVector<ItemId>& itemIds, const QString& lpTin) {
-    return QtConcurrent::run([this, itemIds, lpTin]() {
-        return doExportItems(itemIds, lpTin);
-    });
-}
-
-QFuture<ExportResult> DbService::exportItemsAsync(ProductionLineId lineId, int limit, const QString& lpTin) {
-    return QtConcurrent::run([this, lineId, limit, lpTin]() {
-        QVector<Item> items = getScannedItemsNotInBox(lineId, limit);
-        QVector<ItemId> ids;
-        for (const auto& it : items) ids.append(it.id);
-        return doExportItems(ids, lpTin);
-    });
-}
-
-QFuture<ExportResult> DbService::exportItemsAsync(int limit, const QString& lpTin) {
-    return exportItemsAsync(0, limit, lpTin);
-}
-
 ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QString& lpTin) {
     ExportResult result;
-
+    
     if (itemIds.isEmpty()) {
         result.error = "No items to export";
         return result;
     }
-
-    // Gather DB connection info
+    
+    // Create thread-local database connection for async operation
     QString dbHost, dbDatabase, dbUser, dbPassword;
     int dbPort;
     {
@@ -1156,96 +1209,106 @@ ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QStr
         dbUser = config_.user;
         dbPassword = config_.password;
     }
-
-    // Create thread-local DB connection for async runs
-    QSqlDatabase db = createThreadLocalConnection(dbHost, dbPort, dbDatabase, dbUser, dbPassword);
+    
+    QSqlDatabase db = createThreadLocalConnection(dbHost, dbPort,
+                                                   dbDatabase, dbUser, dbPassword);
+    
     if (!db.isOpen()) {
         result.error = "Failed to create database connection";
         return result;
     }
-
+    
     db.transaction();
-
-    // Build ID list
+    
+    // Build ID list for IN clause
     QStringList idStrings;
-    for (ItemId id : itemIds) idStrings.append(QString::number(id));
+    for (ItemId id : itemIds) {
+        idStrings.append(QString::number(id));
+    }
     QString idList = idStrings.join(",");
-
-    // Verify items: scanned, not assigned to a box, not already exported
-    QSqlQuery verify(db);
-    QString verSql = QString(
+    
+    // Verify items have status = 1 (Assigned/Scanned) and are not in any box
+    QSqlQuery verifyQuery(db);
+    QString verifySql = QString(
         "SELECT COUNT(*) FROM items i "
         "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
-        "WHERE i.id IN (%1) AND i.scanned_at IS NOT NULL AND iba.item_id IS NULL AND i.status != %2"
-    ).arg(idList).arg(static_cast<int>(ItemStatus::Exported));
-
-    if (!verify.exec(verSql) || !verify.next()) {
+        "WHERE i.id IN (%1) AND i.status = 1 AND iba.item_id IS NULL"
+    ).arg(idList);
+    
+    if (!verifyQuery.exec(verifySql) || !verifyQuery.next()) {
         db.rollback();
         result.error = "Verify query failed";
         return result;
     }
-
-    if (verify.value(0).toInt() != itemIds.size()) {
+    
+    if (verifyQuery.value(0).toInt() != itemIds.size()) {
         db.rollback();
-        result.error = "Some items are not eligible for export (they may be boxed, not scanned or already exported)";
+        result.error = "Some items not found, not scanned, or already assigned to a box";
         return result;
     }
-
-    // Create export document
+    
+    // Create document with export_mode = 2 (ItemExport)
     QSqlQuery createDoc(db);
     createDoc.prepare(
         "INSERT INTO export_documents (export_mode, lp_tin, created_at) "
-        "VALUES (:mode, :lpTin, NOW()) RETURNING id"
+        "VALUES (2, :lpTin, NOW()) RETURNING id"
     );
-    createDoc.bindValue(":mode", static_cast<int>(ExportMode::ItemExport));
     createDoc.bindValue(":lpTin", lpTin);
-
+    
     if (!createDoc.exec() || !createDoc.next()) {
         db.rollback();
         result.error = "Failed to create document";
         return result;
     }
+    
     result.documentId = createDoc.value(0).toLongLong();
-
-    // Snapshot items into export_items
+    
+    // Snapshot items (store barcodes in snapshot)
     QString snapshotSql = QString(
         "INSERT INTO export_items (document_id, bar_code, created_at) "
         "SELECT %1, bar_code, NOW() FROM items WHERE id IN (%2)"
     ).arg(result.documentId).arg(idList);
-
-    QSqlQuery snapshotQ(db);
-    if (!snapshotQ.exec(snapshotSql)) {
+    
+    QSqlQuery snapshotQuery(db);
+    if (!snapshotQuery.exec(snapshotSql)) {
         db.rollback();
         result.error = "Failed to snapshot items";
         return result;
     }
-    result.itemsExported = snapshotQ.numRowsAffected();
-
+    result.itemsExported = snapshotQuery.numRowsAffected();
+    
     // Update item statuses to Exported
-    QSqlQuery updateQ(db);
-    QString updateSql = QString("UPDATE items SET status = %1 WHERE id IN (%2)")
-        .arg(static_cast<int>(ItemStatus::Exported)).arg(idList);
-    if (!updateQ.exec(updateSql)) {
+    QString updateSql = QString(
+        "UPDATE items SET status = 2 WHERE id IN (%1)"
+    ).arg(idList);
+    
+    QSqlQuery updateQuery(db);
+    if (!updateQuery.exec(updateSql)) {
         db.rollback();
         result.error = "Failed to update item statuses";
         return result;
     }
-
+    
     db.commit();
     result.success = true;
-
+    
     qDebug() << "DbService: Item export complete - Doc:" << result.documentId;
-
-    // Generate XML and persist into document record (best-effort; failures only logged)
-    QString xml = generateItemExportXml(result.documentId, lpTin, db);
-    QSqlQuery updateXml(db);
-    updateXml.prepare("UPDATE export_documents SET xml_content = :xml WHERE id = :id");
-    updateXml.bindValue(":xml", xml.toUtf8());
-    updateXml.bindValue(":id", result.documentId);
-    if (!updateXml.exec()) {
-        qDebug() << "Warning: Failed to update XML content:" << updateXml.lastError().text();
+    
+    // Generate XML content
+    QString xmlContent = generateItemExportXml(result.documentId, lpTin, db);
+    
+    // Update document with XML content
+    QSqlQuery updateXmlQuery(db);
+    updateXmlQuery.prepare(
+        "UPDATE export_documents SET xml_content = :xml WHERE id = :id"
+    );
+    updateXmlQuery.bindValue(":xml", xmlContent.toUtf8());
+    updateXmlQuery.bindValue(":id", result.documentId);
+    
+    if (!updateXmlQuery.exec()) {
+        qDebug() << "Warning: Failed to update XML content:" << updateXmlQuery.lastError().text();
     }
-
+    
     return result;
 }
 
@@ -2448,29 +2511,32 @@ QString DbService::cleanBarcodeForExport(const QString& barcode) {
 QString DbService::generateItemExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db) {
     QString xml;
     xml += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
-    xml += "<items_export>\n";
+    xml += "<item_export>\n";
     xml += "  <Document>\n";
     xml += "    <organisation>\n";
     xml += "      <id_info>\n";
     xml += QString("        <LP_info LP_TIN=\"%1\" />\n").arg(lpTin);
     xml += "      </id_info>\n";
     xml += "    </organisation>\n";
-
-    QSqlQuery q(db);
-    q.prepare("SELECT bar_code FROM export_items WHERE document_id = :docId ORDER BY created_at");
-    q.bindValue(":docId", docId);
-    if (q.exec()) {
-        while (q.next()) {
-            QString bc = cleanBarcodeForExport(q.value(0).toString());
-            xml += QString("    <item><cis><![CDATA[%1]]></cis></item>\n").arg(bc);
-        }
+    
+    // Get all items for this export
+    QSqlQuery itemQuery(db);
+    itemQuery.prepare("SELECT bar_code FROM export_items WHERE document_id = :docId ORDER BY created_at");
+    itemQuery.bindValue(":docId", docId);
+    
+    if (!itemQuery.exec()) {
+        qDebug() << "Failed to query export items:" << itemQuery.lastError().text();
+        return xml;
     }
-    else {
-        qDebug() << "Failed to query export_items for document" << docId << ":" << q.lastError().text();
+    
+    while (itemQuery.next()) {
+        QString itemBarcode = cleanBarcodeForExport(itemQuery.value(0).toString());
+        xml += QString("    <cis><![CDATA[%1]]></cis>\n").arg(itemBarcode);
     }
-
+    
     xml += "  </Document>\n";
-    xml += "</items_export>\n";
+    xml += "</item_export>\n";
+    
     return xml;
 }
 

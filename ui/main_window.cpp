@@ -10,6 +10,7 @@
 #include <QSettings>
 #include <QApplication>
 #include <QDebug>
+#include <QScreen>
 
 namespace core {
 
@@ -37,7 +38,20 @@ MainWindow::MainWindow(QWidget* parent)
     }
     
     setWindowTitle("BackOffice Application v2.0");
-    resize(1000, 700);
+    
+    // Set window size to fit within available screen geometry (excluding taskbar)
+    QScreen* screen = QApplication::primaryScreen();
+    if (screen) {
+        QRect availableGeometry = screen->availableGeometry();
+        int width = qMin(1200, availableGeometry.width() - 50);
+        int height = qMin(800, availableGeometry.height() - 50);
+        resize(width, height);
+        // Center the window on screen
+        move(availableGeometry.x() + (availableGeometry.width() - width) / 2,
+             availableGeometry.y() + (availableGeometry.height() - height) / 2);
+    } else {
+        resize(1000, 700);
+    }
 }
 
 MainWindow::~MainWindow() {
@@ -47,7 +61,13 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::setupUi() {    
-    // Status bar with stats label
+    // Status bar with refresh button on the left
+    refreshStatsBtn_ = new QPushButton("Refresh Stats");
+    refreshStatsBtn_->setEnabled(false);
+    statusBar()->addWidget(refreshStatsBtn_);
+    connect(refreshStatsBtn_, &QPushButton::clicked, this, &MainWindow::onRefreshStats);
+    
+    // Stats label on the right
     statsLabel_ = new QLabel("Not connected");
     statusBar()->addPermanentWidget(statsLabel_);
     statusBar()->showMessage("Ready");
@@ -87,10 +107,14 @@ void MainWindow::setupMenus() {
     // === Toolbar ===
     auto* toolbar = addToolBar("Main");
     toolbar->setMovable(false);
+    
+    // Add spacer to push login/logout to the right
+    auto* spacer = new QWidget();
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolbar->addWidget(spacer);
+    
     toolbar->addAction(loginAction_);
     toolbar->addAction(logoutAction_);
-    toolbar->addSeparator();
-    toolbar->addAction(refreshAction_);
 }
 
 void MainWindow::loadConfig() {
@@ -143,6 +167,7 @@ void MainWindow::updateState() {
     loginAction_->setEnabled(connected_ && !loggedIn_);
     logoutAction_->setEnabled(loggedIn_);
     refreshAction_->setEnabled(connected_);
+    refreshStatsBtn_->setEnabled(connected_);
     
     // Status display
     updateStatsDisplay();
