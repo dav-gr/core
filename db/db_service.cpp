@@ -552,90 +552,38 @@ QVector<Item> DbService::getItemsInBox(BoxId boxId) {
     return items;
 }
 
-bool DbService::assignItemToBox(ItemId itemId, BoxId boxId) {
-    if (!ensureConnected()) return false;
-    
-    QSqlDatabase db = getDatabase();
-    db.transaction();
-    
-    // Verify box exists and is empty (status = 0)
-    QSqlQuery boxQuery(db);
-    boxQuery.prepare("SELECT id, status FROM boxes WHERE id = :id");
-    boxQuery.bindValue(":id", boxId);
-    
-    if (!boxQuery.exec() || !boxQuery.next()) {
-        db.rollback();
-        QMutexLocker locker(&mutex_);
-        lastError_ = "Box not found";
-        return false;
-    }
-    
-    if (boxQuery.value(1).toInt() != 0) {
-        db.rollback();
-        QMutexLocker locker(&mutex_);
-        lastError_ = "Box must be Empty";
-        return false;
-    }
-    
-    // Verify item exists and is available (status = 0)
-    QSqlQuery itemQuery(db);
-    itemQuery.prepare("SELECT id, status FROM items WHERE id = :id");
-    itemQuery.bindValue(":id", itemId);
-    
-    if (!itemQuery.exec() || !itemQuery.next()) {
-        db.rollback();
-        QMutexLocker locker(&mutex_);
-        lastError_ = "Item not found";
-        return false;
-    }
-    
-    if (itemQuery.value(1).toInt() != 0) {
-        db.rollback();
-        QMutexLocker locker(&mutex_);
-        lastError_ = "Item must be Available";
-        return false;
-    }
-    
-    // Create assignment
-    QSqlQuery assignQuery(db);
-    assignQuery.prepare(
-        "INSERT INTO item_box_assignments (item_id, box_id, assigned_at) "
-        "VALUES (:itemId, :boxId, NOW())"
-    );
-    assignQuery.bindValue(":itemId", itemId);
-    assignQuery.bindValue(":boxId", boxId);
-    
-    if (!assignQuery.exec()) {
-        db.rollback();
-        QMutexLocker locker(&mutex_);
-        lastError_ = assignQuery.lastError().text();
-        return false;
-    }
-    
-    // Update item status
-    QSqlQuery updateQuery(db);
-    updateQuery.prepare("UPDATE items SET status = 1 WHERE id = :id");
-    updateQuery.bindValue(":id", itemId);
-    
-    if (!updateQuery.exec()) {
-        db.rollback();
-        QMutexLocker locker(&mutex_);
-        lastError_ = updateQuery.lastError().text();
-        return false;
-    }
-    
-    db.commit();
-    return true;
-}
+QVector<Item> DbService::getScannedItemsNotInBox(ProductionLineId lineId, int limit) {
+    QVector<Item> items;
+    if (!ensureConnected()) return items;
 
-int DbService::assignItemsToBox(const QVector<ItemId>& itemIds, BoxId boxId) {
-    int count = 0;
-    for (ItemId itemId : itemIds) {
-        if (assignItemToBox(itemId, boxId)) {
-            count++;
-        }
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+
+    QString sql =
+        "SELECT i.id, i.bar_code, i.status, i.production_line, i.imported_at, i.scanned_at "
+        "FROM items i "
+        "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
+        "WHERE i.scanned_at IS NOT NULL AND iba.item_id IS NULL";
+
+    if (lineId > 0) {
+        sql += " AND i.production_line = :lineId";
     }
-    return count;
+    sql += " ORDER BY i.scanned_at DESC LIMIT :limit";
+
+    query.prepare(sql);
+    if (lineId > 0) query.bindValue(":lineId", lineId);
+    query.bindValue(":limit", limit);
+
+    if (query.exec()) {
+        while (query.next()) {
+            items.append(parseItem(query));
+        }
+    } else {
+        QMutexLocker locker(&mutex_);
+        lastError_ = query.lastError().text();
+    }
+
+    return items;
 }
 
 // ============================================================================
@@ -1168,6 +1116,137 @@ QFuture<ExportResult> DbService::exportPalletsAsync(const QVector<PalletId>& pal
     return QtConcurrent::run([this, palletIds, lpTin]() {
         return doExportPallets(palletIds, lpTin);
     });
+}
+
+QFuture<ExportResult> DbService::exportItemsAsync(const QVector<ItemId>& itemIds, const QString& lpTin) {
+    return QtConcurrent::run([this, itemIds, lpTin]() {
+        return doExportItems(itemIds, lpTin);
+    });
+}
+
+QFuture<ExportResult> DbService::exportItemsAsync(ProductionLineId lineId, int limit, const QString& lpTin) {
+    return QtConcurrent::run([this, lineId, limit, lpTin]() {
+        QVector<Item> items = getScannedItemsNotInBox(lineId, limit);
+        QVector<ItemId> ids;
+        for (const auto& it : items) ids.append(it.id);
+        return doExportItems(ids, lpTin);
+    });
+}
+
+QFuture<ExportResult> DbService::exportItemsAsync(int limit, const QString& lpTin) {
+    return exportItemsAsync(0, limit, lpTin);
+}
+
+ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QString& lpTin) {
+    ExportResult result;
+
+    if (itemIds.isEmpty()) {
+        result.error = "No items to export";
+        return result;
+    }
+
+    // Gather DB connection info
+    QString dbHost, dbDatabase, dbUser, dbPassword;
+    int dbPort;
+    {
+        QMutexLocker locker(&mutex_);
+        dbHost = config_.host;
+        dbPort = config_.port;
+        dbDatabase = config_.database;
+        dbUser = config_.user;
+        dbPassword = config_.password;
+    }
+
+    // Create thread-local DB connection for async runs
+    QSqlDatabase db = createThreadLocalConnection(dbHost, dbPort, dbDatabase, dbUser, dbPassword);
+    if (!db.isOpen()) {
+        result.error = "Failed to create database connection";
+        return result;
+    }
+
+    db.transaction();
+
+    // Build ID list
+    QStringList idStrings;
+    for (ItemId id : itemIds) idStrings.append(QString::number(id));
+    QString idList = idStrings.join(",");
+
+    // Verify items: scanned, not assigned to a box, not already exported
+    QSqlQuery verify(db);
+    QString verSql = QString(
+        "SELECT COUNT(*) FROM items i "
+        "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
+        "WHERE i.id IN (%1) AND i.scanned_at IS NOT NULL AND iba.item_id IS NULL AND i.status != %2"
+    ).arg(idList).arg(static_cast<int>(ItemStatus::Exported));
+
+    if (!verify.exec(verSql) || !verify.next()) {
+        db.rollback();
+        result.error = "Verify query failed";
+        return result;
+    }
+
+    if (verify.value(0).toInt() != itemIds.size()) {
+        db.rollback();
+        result.error = "Some items are not eligible for export (they may be boxed, not scanned or already exported)";
+        return result;
+    }
+
+    // Create export document
+    QSqlQuery createDoc(db);
+    createDoc.prepare(
+        "INSERT INTO export_documents (export_mode, lp_tin, created_at) "
+        "VALUES (:mode, :lpTin, NOW()) RETURNING id"
+    );
+    createDoc.bindValue(":mode", static_cast<int>(ExportMode::ItemExport));
+    createDoc.bindValue(":lpTin", lpTin);
+
+    if (!createDoc.exec() || !createDoc.next()) {
+        db.rollback();
+        result.error = "Failed to create document";
+        return result;
+    }
+    result.documentId = createDoc.value(0).toLongLong();
+
+    // Snapshot items into export_items
+    QString snapshotSql = QString(
+        "INSERT INTO export_items (document_id, bar_code, created_at) "
+        "SELECT %1, bar_code, NOW() FROM items WHERE id IN (%2)"
+    ).arg(result.documentId).arg(idList);
+
+    QSqlQuery snapshotQ(db);
+    if (!snapshotQ.exec(snapshotSql)) {
+        db.rollback();
+        result.error = "Failed to snapshot items";
+        return result;
+    }
+    result.itemsExported = snapshotQ.numRowsAffected();
+
+    // Update item statuses to Exported
+    QSqlQuery updateQ(db);
+    QString updateSql = QString("UPDATE items SET status = %1 WHERE id IN (%2)")
+        .arg(static_cast<int>(ItemStatus::Exported)).arg(idList);
+    if (!updateQ.exec(updateSql)) {
+        db.rollback();
+        result.error = "Failed to update item statuses";
+        return result;
+    }
+
+    db.commit();
+    result.success = true;
+
+    qDebug() << "DbService: Item export complete - Doc:" << result.documentId;
+
+    // Generate XML and persist into document record (best-effort; failures only logged)
+    QString xml = generateItemExportXml(result.documentId, lpTin, db);
+    QSqlQuery updateXml(db);
+    updateXml.prepare("UPDATE export_documents SET xml_content = :xml WHERE id = :id");
+    updateXml.bindValue(":xml", xml.toUtf8());
+    updateXml.bindValue(":id", result.documentId);
+    if (!updateXml.exec()) {
+        qDebug() << "Warning: Failed to update XML content:" << updateXml.lastError().text();
+    }
+
+    return result;
 }
 
 ExportResult DbService::doExportBoxes(const QVector<BoxId>& boxIds, const QString& lpTin) {
@@ -2364,6 +2443,35 @@ QString DbService::cleanBarcodeForExport(const QString& barcode) {
     
     // No separator found, return original barcode
     return barcode;
+}
+
+QString DbService::generateItemExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db) {
+    QString xml;
+    xml += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+    xml += "<items_export>\n";
+    xml += "  <Document>\n";
+    xml += "    <organisation>\n";
+    xml += "      <id_info>\n";
+    xml += QString("        <LP_info LP_TIN=\"%1\" />\n").arg(lpTin);
+    xml += "      </id_info>\n";
+    xml += "    </organisation>\n";
+
+    QSqlQuery q(db);
+    q.prepare("SELECT bar_code FROM export_items WHERE document_id = :docId ORDER BY created_at");
+    q.bindValue(":docId", docId);
+    if (q.exec()) {
+        while (q.next()) {
+            QString bc = cleanBarcodeForExport(q.value(0).toString());
+            xml += QString("    <item><cis><![CDATA[%1]]></cis></item>\n").arg(bc);
+        }
+    }
+    else {
+        qDebug() << "Failed to query export_items for document" << docId << ":" << q.lastError().text();
+    }
+
+    xml += "  </Document>\n";
+    xml += "</items_export>\n";
+    return xml;
 }
 
 QString DbService::generateBoxExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db) {

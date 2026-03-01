@@ -11,22 +11,6 @@
 
 namespace core {
 
-/**
- * @brief Single database service for all database operations
- * 
- * Design:
- * - SYNC for fast queries (<100ms): auth, getItem, stats
- * - ASYNC for slow operations: imports, exports
- * - Uses Qt's QSqlDatabase with PostgreSQL driver (QPSQL)
- * - Thread-safe via QMutex
- * 
- * Usage:
- *   DbService db;
- *   if (db.connect(config)) {
- *       auto user = db.authenticate(pinHash);
- *       auto stats = db.getStats();
- *   }
- */
 class DbService : public QObject {
     Q_OBJECT
 
@@ -141,6 +125,7 @@ public:
     QVector<Item> getItemsInBox(BoxId boxId);
     bool assignItemToBox(ItemId itemId, BoxId boxId);
     int assignItemsToBox(const QVector<ItemId>& itemIds, BoxId boxId);
+    QVector<Item> getScannedItemsNotInBox(ProductionLineId lineId = 0, int limit = 1000);
 
     // =========================================================================
     // Box Operations (SYNC)
@@ -186,7 +171,12 @@ public:
                                             const QString& lpTin);
     QFuture<ExportResult> exportPalletsAsync(const QVector<PalletId>& palletIds,
                                               const QString& lpTin);
-    
+    QFuture<ExportResult> exportItemsAsync(const QVector<ItemId>& itemIds,
+                                           const QString& lpTin);
+    // Export scanned (not in box) items by fetching them from DB
+    QFuture<ExportResult> exportItemsAsync(ProductionLineId lineId, int limit, const QString& lpTin);
+    QFuture<ExportResult> exportItemsAsync(int limit, const QString& lpTin);
+
     std::optional<ExportDocument> getExportDocument(ExportDocumentId id);
     QVector<ExportDocument> getExportDocuments(int limit = 50, int offset = 0);
     int getExportDocumentItemCount(ExportDocumentId id);
@@ -220,8 +210,10 @@ private:
     // Export helpers
     ExportResult doExportBoxes(const QVector<BoxId>& boxIds, const QString& lpTin);
     ExportResult doExportPallets(const QVector<PalletId>& palletIds, const QString& lpTin);
+    ExportResult doExportItems(const QVector<ItemId>& itemIds, const QString& lpTin);
     QString generateBoxExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
     QString generatePalletExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
+    QString generateItemExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
     QString cleanBarcodeForExport(const QString& barcode);
     
     // Parse helpers
