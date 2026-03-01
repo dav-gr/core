@@ -120,14 +120,13 @@ public:
     
     std::optional<Item> getItem(ItemId id);
     QVector<Item> getItemsByStatus(ItemStatus status, 
-                                    ProductionLineId lineId = 0, 
-                                    int limit = 100);
+                                    ProductionLineId lineId, 
+                                    int limit);
     QVector<Item> getItemsInBox(BoxId boxId);
-    QVector<Item> getScannedItemsNotInBox(ProductionLineId lineId = 0, int limit = 200);
-    int countScannedItemsNotInBox(ProductionLineId lineId = 0);
+    int countScannedItemsNotInBox(ProductionLineId lineId);
     bool assignItemToBox(ItemId itemId, BoxId boxId);
     int assignItemsToBox(const QVector<ItemId>& itemIds, BoxId boxId);
-    QVector<Item> getScannedItemsNotInBox(ProductionLineId lineId = 0, int limit = 1000);
+    QVector<Item> getScannedItemsNotInBox(ProductionLineId lineId, int limit);
 
     // =========================================================================
     // Box Operations (SYNC)
@@ -135,10 +134,10 @@ public:
     
     std::optional<Box> getBox(BoxId id);
     QVector<Box> getBoxesByStatus(BoxStatus status, 
-                                   ProductionLineId lineId = 0,
-                                   int limit = 100);
-    QVector<Box> getSealedBoxesNotOnPallet(ProductionLineId lineId = 0, int limit = 200);
-    int countSealedBoxesNotOnPallet(ProductionLineId lineId = 0);
+                                   ProductionLineId lineId,
+                                   int limit);
+    QVector<Box> getSealedBoxesNotOnPallet(ProductionLineId lineId, int limit);
+    int countSealedBoxesNotOnPallet(ProductionLineId lineId);
     QVector<Box> getBoxesOnPallet(PalletId palletId);
     bool sealBox(BoxId id);
     bool assignBoxToPallet(BoxId boxId, PalletId palletId);
@@ -175,11 +174,7 @@ public:
                                             const QString& lpTin);
     QFuture<ExportResult> exportPalletsAsync(const QVector<PalletId>& palletIds,
                                               const QString& lpTin);
-    QFuture<ExportResult> exportItemsAsync(const QVector<ItemId>& itemIds,
-                                           const QString& lpTin);
     // Export scanned (not in box) items by fetching them from DB
-    QFuture<ExportResult> exportItemsAsync(ProductionLineId lineId, int limit, const QString& lpTin);
-    QFuture<ExportResult> exportItemsAsync(int limit, const QString& lpTin);
 
     std::optional<ExportDocument> getExportDocument(ExportDocumentId id);
     QVector<ExportDocument> getExportDocuments(int limit = 50, int offset = 0);

@@ -559,35 +559,32 @@ QVector<Item> DbService::getItemsInBox(BoxId boxId) {
 
 QVector<Item> DbService::getScannedItemsNotInBox(ProductionLineId lineId, int limit) {
     QVector<Item> items;
-    
+
     if (!ensureConnected()) return items;
-    
+
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
-    
+
     QString sql = 
         "SELECT i.id, i.bar_code, i.status, i.production_line, i.imported_at, i.scanned_at "
         "FROM items i "
         "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
         "WHERE i.status = 1 AND iba.item_id IS NULL";
-    
+
     if (lineId > 0) {
-        sql += " AND i.production_line = :lineId";
+        sql += QString(" AND i.production_line = %1").arg(lineId);
     }
-    sql += " ORDER BY i.scanned_at LIMIT :limit";
-    
-    query.prepare(sql);
-    if (lineId > 0) {
-        query.bindValue(":lineId", lineId);
-    }
-    query.bindValue(":limit", limit);
-    
-    if (query.exec()) {
+    sql += QString(" ORDER BY i.scanned_at LIMIT %1").arg(limit);
+
+    if (query.exec(sql)) {
         while (query.next()) {
             items.append(parseItem(query));
         }
+    } else {
+        qWarning() << "DbService::getScannedItemsNotInBox failed:" << query.lastError().text();
+        qWarning() << "Query:" << sql;
     }
-    
+
     return items;
 }
 
@@ -619,36 +616,89 @@ int DbService::countScannedItemsNotInBox(ProductionLineId lineId) {
 }
 
 bool DbService::assignItemToBox(ItemId itemId, BoxId boxId) {
-    if (!ensureConnected()) return false;
-    
+     if (!ensureConnected()) return false;
+
     QSqlDatabase db = getDatabase();
-    QSqlQuery query(db);
-
-    QString sql =
-        "SELECT i.id, i.bar_code, i.status, i.production_line, i.imported_at, i.scanned_at "
-        "FROM items i "
-        "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
-        "WHERE i.scanned_at IS NOT NULL AND iba.item_id IS NULL";
-
-    if (lineId > 0) {
-        sql += " AND i.production_line = :lineId";
-    }
-    sql += " ORDER BY i.scanned_at DESC LIMIT :limit";
-
-    query.prepare(sql);
-    if (lineId > 0) query.bindValue(":lineId", lineId);
-    query.bindValue(":limit", limit);
-
-    if (query.exec()) {
-        while (query.next()) {
-            items.append(parseItem(query));
-        }
-    } else {
+    db.transaction();
+    
+    // Verify box exists and is empty (status = 0)
+    QSqlQuery boxQuery(db);
+    boxQuery.prepare("SELECT id, status FROM boxes WHERE id = :id");
+    boxQuery.bindValue(":id", boxId);
+    
+    if (!boxQuery.exec() || !boxQuery.next()) {
+        db.rollback();
         QMutexLocker locker(&mutex_);
-        lastError_ = query.lastError().text();
+        lastError_ = "Box not found";
+        return false;
     }
+    
+    if (boxQuery.value(1).toInt() != 0) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = "Box must be Empty";
+        return false;
+    }
+    
+    // Verify item exists and is available (status = 0)
+    QSqlQuery itemQuery(db);
+    itemQuery.prepare("SELECT id, status FROM items WHERE id = :id");
+    itemQuery.bindValue(":id", itemId);
+    
+    if (!itemQuery.exec() || !itemQuery.next()) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = "Item not found";
+        return false;
+    }
+    
+    if (itemQuery.value(1).toInt() != 0) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = "Item must be Available";
+        return false;
+    }
+    
+    // Create assignment
+    QSqlQuery assignQuery(db);
+    assignQuery.prepare(
+        "INSERT INTO item_box_assignments (item_id, box_id, assigned_at) "
+        "VALUES (:itemId, :boxId, NOW())"
+    );
+    assignQuery.bindValue(":itemId", itemId);
+    assignQuery.bindValue(":boxId", boxId);
+    
+    if (!assignQuery.exec()) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = assignQuery.lastError().text();
+        return false;
+    }
+    
+    // Update item status
+    QSqlQuery updateQuery(db);
+    updateQuery.prepare("UPDATE items SET status = 1 WHERE id = :id");
+    updateQuery.bindValue(":id", itemId);
+    
+    if (!updateQuery.exec()) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = updateQuery.lastError().text();
+        return false;
+    }
+    
+    db.commit();
+    return true;
+}
 
-    return items;
+int DbService::assignItemsToBox(const QVector<ItemId>& itemIds, BoxId boxId) {
+    int count = 0;
+    for (ItemId itemId : itemIds) {
+        if (assignItemToBox(itemId, boxId)) {
+            count++;
+        }
+    }
+    return count;
 }
 
 // ============================================================================
@@ -676,68 +726,61 @@ std::optional<Box> DbService::getBox(BoxId id) {
 QVector<Box> DbService::getBoxesByStatus(BoxStatus status, ProductionLineId lineId,
                                           int limit) {
     QVector<Box> boxes;
-    
+
     if (!ensureConnected()) return boxes;
-    
+
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
-    
-    QString sql = 
+
+    QString sql = QString(
         "SELECT id, bar_code, status, production_line, imported_at, sealed_at "
-        "FROM boxes WHERE status = :status";
-    
+        "FROM boxes WHERE status = %1").arg(static_cast<int>(status));
+
     if (lineId > 0) {
-        sql += " AND production_line = :lineId";
+        sql += QString(" AND production_line = %1").arg(lineId);
     }
-    sql += " ORDER BY imported_at LIMIT :limit";
-    
-    query.prepare(sql);
-    query.bindValue(":status", static_cast<int>(status));
-    if (lineId > 0) {
-        query.bindValue(":lineId", lineId);
-    }
-    query.bindValue(":limit", limit);
-    
-    if (query.exec()) {
+    sql += QString(" ORDER BY imported_at LIMIT %1").arg(limit);
+
+    if (query.exec(sql)) {
         while (query.next()) {
             boxes.append(parseBox(query));
         }
+    } else {
+        qWarning() << "DbService::getBoxesByStatus failed:" << query.lastError().text();
+        qWarning() << "Query:" << sql;
     }
-    
+
     return boxes;
 }
 
 QVector<Box> DbService::getSealedBoxesNotOnPallet(ProductionLineId lineId, int limit) {
     QVector<Box> boxes;
-    
+
     if (!ensureConnected()) return boxes;
-    
+
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
-    
+
     QString sql = 
         "SELECT b.id, b.bar_code, b.status, b.production_line, b.imported_at, b.sealed_at "
         "FROM boxes b "
         "LEFT JOIN pallet_box_assignments pba ON b.id = pba.box_id "
         "WHERE b.status = 1 AND pba.box_id IS NULL";
-    
+
     if (lineId > 0) {
-        sql += " AND b.production_line = :lineId";
+        sql += QString(" AND b.production_line = %1").arg(lineId);
     }
-    sql += " ORDER BY b.imported_at LIMIT :limit";
-    
-    query.prepare(sql);
-    if (lineId > 0) {
-        query.bindValue(":lineId", lineId);
-    }
-    query.bindValue(":limit", limit);
-    
-    if (query.exec()) {
+    sql += QString(" ORDER BY b.imported_at LIMIT %1").arg(limit);
+
+    if (query.exec(sql)) {
         while (query.next()) {
             boxes.append(parseBox(query));
         }
+    } else {
+        qWarning() << "DbService::getSealedBoxesNotOnPallet failed:" << query.lastError().text();
+        qWarning() << "Query:" << sql;
     }
-    
+
     return boxes;
 }
 
@@ -953,34 +996,43 @@ QVector<Pallet> DbService::getPallets() {
 QVector<Pallet> DbService::getPalletsByStatus(PalletStatus status, ProductionLineId lineId,
                                                int limit) {
     QVector<Pallet> pallets;
-    
+
     if (!ensureConnected()) return pallets;
-    
+
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
-    
-    QString sql = 
-        "SELECT id, bar_code, status, production_line, package_id, package_count, created_at "
-        "FROM pallets WHERE status = :status";
-    
+
+    // TODO: Update to new schema with package_id and package_count columns in future
+    // Legacy schema: id, bar_code, production_line, status, created_at
+    QString sql = QString(
+        "SELECT id, bar_code, status, production_line, created_at "
+        "FROM pallets WHERE status = %1").arg(static_cast<int>(status));
+
     if (lineId > 0) {
-        sql += " AND production_line = :lineId";
+        sql += QString(" AND production_line = %1").arg(lineId);
     }
-    sql += " ORDER BY created_at LIMIT :limit";
-    
-    query.prepare(sql);
-    query.bindValue(":status", static_cast<int>(status));
-    if (lineId > 0) {
-        query.bindValue(":lineId", lineId);
-    }
-    query.bindValue(":limit", limit);
-    
-    if (query.exec()) {
+    sql += QString(" ORDER BY created_at LIMIT %1").arg(limit);
+
+    if (query.exec(sql)) {
         while (query.next()) {
-            pallets.append(parsePallet(query));
+            // Parse legacy schema (without package_id and package_count)
+            Pallet pallet;
+            pallet.id = query.value(0).toLongLong();
+            pallet.barcode = query.value(1).toString();
+            pallet.status = static_cast<PalletStatus>(query.value(2).toInt());
+            pallet.productionLine = query.value(3).toLongLong();
+            pallet.createdAt = query.value(4).toDateTime();
+            pallet.packageId = 0;  // Not in legacy schema
+            pallet.packageCount = 0;  // Not in legacy schema
+
+            pallets.append(pallet);
         }
+    } else {
+        qWarning() << "DbService::getPalletsByStatus failed:" << query.lastError().text();
+        qWarning() << "Query:" << sql;
+        qWarning() << "Status:" << static_cast<int>(status) << "LineId:" << lineId << "Limit:" << limit;
     }
-    
+
     return pallets;
 }
 
