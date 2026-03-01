@@ -45,7 +45,8 @@ enum class PalletStatus : qint16 {
 
 enum class ExportMode : qint16 { 
     BoxExport = 0, 
-    PalletExport = 1 
+    PalletExport = 1,
+    ItemExport = 2
 };
 
 // Status to string helpers

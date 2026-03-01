@@ -5,6 +5,7 @@
 #include <QTabWidget>
 #include <QStatusBar>
 #include <QLabel>
+#include <QPushButton>
 #include <memory>
 #include <optional>
 
@@ -57,6 +58,7 @@ protected:
     QAction* loginAction_ = nullptr;
     QAction* logoutAction_ = nullptr;
     QAction* refreshAction_ = nullptr;
+    QPushButton* refreshStatsBtn_ = nullptr;
     QLabel* statsLabel_ = nullptr;
     
     // State

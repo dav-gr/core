@@ -139,6 +139,8 @@ public:
                                     ProductionLineId lineId = 0, 
                                     int limit = 100);
     QVector<Item> getItemsInBox(BoxId boxId);
+    QVector<Item> getScannedItemsNotInBox(ProductionLineId lineId = 0, int limit = 200);
+    int countScannedItemsNotInBox(ProductionLineId lineId = 0);
     bool assignItemToBox(ItemId itemId, BoxId boxId);
     int assignItemsToBox(const QVector<ItemId>& itemIds, BoxId boxId);
 
@@ -172,6 +174,8 @@ public:
     // Export Operations (ASYNC)
     // =========================================================================
     
+    QFuture<ExportResult> exportItemsAsync(const QVector<ItemId>& itemIds,
+                                            const QString& lpTin);
     QFuture<ExportResult> exportBoxesAsync(const QVector<BoxId>& boxIds, 
                                             const QString& lpTin);
     QFuture<ExportResult> exportPalletsAsync(const QVector<PalletId>& palletIds,
@@ -201,20 +205,22 @@ signals:
     void importProgress(int current, int total);
 
 private:
-    bool ensureConnected();
+bool ensureConnected();
     
-    // Import helpers
-    ImportResult doImport(const QString& filePath, ProductionLineId lineId,
-                          const QString& tableName);
+// Import helpers
+ImportResult doImport(const QString& filePath, ProductionLineId lineId,
+                      const QString& tableName);
     
-    // Export helpers
-    ExportResult doExportBoxes(const QVector<BoxId>& boxIds, const QString& lpTin);
-    ExportResult doExportPallets(const QVector<PalletId>& palletIds, const QString& lpTin);
-    QString generateBoxExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
-    QString generatePalletExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
-    QString cleanBarcodeForExport(const QString& barcode);
+// Export helpers
+ExportResult doExportItems(const QVector<ItemId>& itemIds, const QString& lpTin);
+ExportResult doExportBoxes(const QVector<BoxId>& boxIds, const QString& lpTin);
+ExportResult doExportPallets(const QVector<PalletId>& palletIds, const QString& lpTin);
+QString generateItemExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
+QString generateBoxExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
+QString generatePalletExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
+QString cleanBarcodeForExport(const QString& barcode);
     
-    // Parse helpers
+// Parse helpers
     User parseUser(const QSqlQuery& query);
     Role parseRole(const QSqlQuery& query);
     Permission parsePermission(const QSqlQuery& query);
