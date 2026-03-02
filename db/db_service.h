@@ -1,13 +1,14 @@
 #ifndef CORE_DB_SERVICE_H
 #define CORE_DB_SERVICE_H
 
+#include "types.h"
+
 #include <QObject>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QFuture>
 #include <QMutex>
 #include <optional>
-#include "types.h"
 
 namespace core {
 
@@ -36,6 +37,8 @@ public:
     
     // Test connection without storing
     static bool testConnection(const AppConfig& config, QString* errorOut = nullptr);
+    static QSqlDatabase createThreadLocalConnection(const QString& host, int port, const QString& database,
+                                             const QString& user, const QString& password);
 
     // =========================================================================
     // Authentication (SYNC)
@@ -132,7 +135,7 @@ public:
     // Box Operations (SYNC)
     // =========================================================================
     
-    std::optional<Box> getBox(BoxId id);
+    std::optional<core::Box> getBox(BoxId id);
     QVector<Box> getBoxesByStatus(BoxStatus status, 
                                    ProductionLineId lineId,
                                    int limit);
@@ -189,6 +192,37 @@ public:
     ProductionStats getStats(std::optional<ProductionLineId> lineId = std::nullopt);
 
     // =========================================================================
+    // Pipeline Support Methods (SYNC)
+    // =========================================================================
+
+    // Entity Resolver: find entity by barcode in global tables
+    // Searches pallets ? boxes ? items
+    std::optional<ResolvedEntity> findEntityByBarcode(const QString& barcode);
+
+    // State Resolver: pallet state queries
+    int countBoxesOnPallet(PalletId palletId);
+    bool isBoxOnPallet(BoxId boxId);
+    std::optional<PalletId> findPalletForBox(BoxId boxId);
+
+    // State Resolver: box state queries
+    bool isBoxFree(BoxId boxId);
+
+    // State Resolver: item state queries
+    std::optional<core::BoxId> findBoxForItem(ItemId itemId);
+
+    // GTIN lookup helpers
+    QString getPackagingGtin(ProductPackagingId packagingId);
+
+    // Action Executor: barcode lookup in specific dynamic tables
+    std::optional<Box> findBoxByBarcode(const QString& barcode);
+    std::optional<Item> findItemByBarcode(const QString& barcode);
+
+    // Action Executor: atomic action operations (use transactions internally)
+    ActionResult unsealBoxAction(BoxId boxId);
+    ActionResult destroyItemAction(ItemId itemId);
+
+
+    // =========================================================================
     // Database Access
     // =========================================================================
     
@@ -200,22 +234,22 @@ signals:
     void importProgress(int current, int total);
 
 private:
-bool ensureConnected();
+    bool ensureConnected();
     
-// Import helpers
-ImportResult doImport(const QString& filePath, ProductionLineId lineId,
-                      const QString& tableName);
+    // Import helpers
+    ImportResult doImport(const QString& filePath, ProductionLineId lineId,
+                          const QString& tableName);
     
-// Export helpers
-ExportResult doExportItems(const QVector<ItemId>& itemIds, const QString& lpTin);
-ExportResult doExportBoxes(const QVector<BoxId>& boxIds, const QString& lpTin);
-ExportResult doExportPallets(const QVector<PalletId>& palletIds, const QString& lpTin);
-QString generateItemExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
-QString generateBoxExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
-QString generatePalletExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
-QString cleanBarcodeForExport(const QString& barcode);
+    // Export helpers
+    ExportResult doExportItems(const QVector<ItemId>& itemIds, const QString& lpTin);
+    ExportResult doExportBoxes(const QVector<BoxId>& boxIds, const QString& lpTin);
+    ExportResult doExportPallets(const QVector<PalletId>& palletIds, const QString& lpTin);
+    QString generateItemExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
+    QString generateBoxExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
+    QString generatePalletExportXml(ExportDocumentId docId, const QString& lpTin, QSqlDatabase& db);
+    QString cleanBarcodeForExport(const QString& barcode);
     
-// Parse helpers
+    // Parse helpers
     User parseUser(const QSqlQuery& query);
     Role parseRole(const QSqlQuery& query);
     Permission parsePermission(const QSqlQuery& query);

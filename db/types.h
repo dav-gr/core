@@ -1,9 +1,11 @@
 #ifndef CORE_TYPES_H
 #define CORE_TYPES_H
 
+#include <QtGlobal>
 #include <QString>
 #include <QDateTime>
 #include <QVector>
+#include <QJsonObject>
 #include <optional>
 #include <cstdint>
 
@@ -191,10 +193,7 @@ struct Pallet {
     QString barcode;
     PalletStatus status = PalletStatus::New;
     ProductionLineId productionLine = 0;
-    ProductPackagingId packageId = 0;
-    int packageCount = 0;
     QDateTime createdAt;
-    // Note: Schema does not have completed_at column
     
     QString statusString() const { return palletStatusToString(status); }
 };
@@ -298,6 +297,103 @@ struct AppConfig {
             .arg(port)
             .arg(database);
     }
+};
+
+// ============================================================================
+// Pipeline Types (Entity Resolver → State Resolver → Capability Engine)
+// ============================================================================
+
+enum class EntityType { Item, Box, Pallet, Unknown };
+
+inline QString entityTypeToString(EntityType t) {
+    switch (t) {
+        case EntityType::Item:   return "item";
+        case EntityType::Box:    return "box";
+        case EntityType::Pallet: return "pallet";
+        default:                 return "unknown";
+    }
+}
+
+inline EntityType entityTypeFromString(const QString& s) {
+    if (s == "item")   return EntityType::Item;
+    if (s == "box")    return EntityType::Box;
+    if (s == "pallet") return EntityType::Pallet;
+    return EntityType::Unknown;
+}
+
+// Resolved entity — result of Entity Resolver
+// Holds the entity plus the GTIN metadata needed to address dynamic tables
+struct ResolvedEntity {
+    EntityType type = EntityType::Unknown;
+
+    // Exactly one of these is populated
+    std::optional<Item>   item;
+    std::optional<Box>    box;
+    std::optional<Pallet> pallet;
+
+    // Table-addressing metadata (populated for item/box)
+    ProductId           productId = 0;
+    ProductPackagingId  packagingId = 0;
+    QString             productGtin;
+    QString             packagingGtin;
+};
+
+// Computed state — result of State Resolver
+// Contains derived state and upward-resolved parent context
+struct EntityState {
+    EntityType type = EntityType::Unknown;
+
+    // Pallet derived state
+    int  palletBoxCount   = 0;
+    int  palletMaxBoxes   = 0;
+    bool palletIsFull     = false;
+    bool palletIsComplete = false;
+
+    // Box derived state
+    int  boxItemCount = 0;
+    bool boxIsFree    = true;
+    bool boxIsSealed  = false;
+
+    // Item derived state
+    bool itemHasBox = false;
+
+    // Upward-resolved parent context
+    std::optional<Box>    parentBox;
+    std::optional<Pallet> parentPallet;
+
+    // Table-addressing metadata (copied from ResolvedEntity)
+    ProductId           productId = 0;
+    ProductPackagingId  packagingId = 0;
+    QString             productGtin;
+    QString             packagingGtin;
+
+    // The original entity data
+    std::optional<Item>   item;
+    std::optional<Box>    box;
+    std::optional<Pallet> pallet;
+};
+
+// Action step definition (from capability rules JSON)
+struct ActionStep {
+    QString name;       // e.g. "box_barcode", "old_box", "new_box"
+    QString input;      // "scan" (only type for now)
+    QString prompt;     // "Scan box to remove"
+};
+
+// Available action — built by Capability Engine
+struct AvailableAction {
+    QString             capability;  // "COMPLETE", "REMOVE", etc.
+    QString             scope;       // "pallet", "box", "item"
+    QString             label;       // Human-readable label for UI
+    QVector<ActionStep> steps;       // Multi-step parameters
+    QString             confirm;     // Confirmation message (may be empty)
+};
+
+// Action result — returned by Action Executor
+struct ActionResult {
+    bool    success = false;
+    QString message;
+    QJsonObject data;
 };
 
 } // namespace core
