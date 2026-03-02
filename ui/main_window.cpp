@@ -87,13 +87,10 @@ void MainWindow::setupMenus() {
     
     // === Settings Menu ===
     auto* settingsMenu = menuBar()->addMenu("&Settings");
-    
-    loginAction_ = settingsMenu->addAction("&Login...", this, &MainWindow::onLogin);
-    loginAction_->setShortcut(QKeySequence("Ctrl+L"));
-    
-    logoutAction_ = settingsMenu->addAction("Log&out", this, &MainWindow::onLogout);
-    logoutAction_->setEnabled(false);
-    
+
+    loginLogoutAction_ = settingsMenu->addAction("&Login...", this, &MainWindow::onLoginLogout);
+    loginLogoutAction_->setShortcut(QKeySequence("Ctrl+L"));
+
     settingsMenu->addSeparator();
     
     settingsMenu->addAction("&Database Configuration...", this, &MainWindow::onConfig);
@@ -112,9 +109,8 @@ void MainWindow::setupMenus() {
     auto* spacer = new QWidget();
     spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     toolbar->addWidget(spacer);
-    
-    toolbar->addAction(loginAction_);
-    toolbar->addAction(logoutAction_);
+
+    toolbar->addAction(loginLogoutAction_);
 }
 
 void MainWindow::loadConfig() {
@@ -163,12 +159,22 @@ void MainWindow::tryAutoConnect() {
 }
 
 void MainWindow::updateState() {   
+    // Update login/logout action text and state
+    if (loggedIn_) {
+        loginLogoutAction_->setText("Log&out");
+        loginLogoutAction_->setEnabled(true);
+    } else if (connected_) {
+        loginLogoutAction_->setText("&Login...");
+        loginLogoutAction_->setEnabled(true);
+    } else {
+        loginLogoutAction_->setText("&Login...");
+        loginLogoutAction_->setEnabled(false);
+    }
+
     // Menu/toolbar state
-    loginAction_->setEnabled(connected_ && !loggedIn_);
-    logoutAction_->setEnabled(loggedIn_);
     refreshAction_->setEnabled(connected_);
     refreshStatsBtn_->setEnabled(connected_);
-    
+
     // Status display
     updateStatsDisplay();
 }
@@ -194,36 +200,38 @@ void MainWindow::updateStatsDisplay() {
     }
 }
 
-void MainWindow::onLogin() {
-    if (!connected_) {
-        QMessageBox::warning(this, "Not Connected",
-            "Please connect to the database first via Settings > Database Configuration.");
-        return;
-    }
-    
-    LoginDialog dialog(db_.get(), this);
-    
-    if (dialog.exec() == QDialog::Accepted) {
-        currentUser_ = dialog.authenticatedUser();
-        loggedIn_ = true;
-        
-        QMessageBox::information(this, "Login Successful",
-            QString("Welcome, %1!").arg(currentUser_->user.fullName));
-        
-        updateState();
-    }
-}
+void MainWindow::onLoginLogout() {
+    if (loggedIn_) {
+        // Handle logout
+        auto reply = QMessageBox::question(this, "Confirm Logout",
+            "Are you sure you want to logout?",
+            QMessageBox::Yes | QMessageBox::No);
 
-void MainWindow::onLogout() {
-    auto reply = QMessageBox::question(this, "Confirm Logout",
-        "Are you sure you want to logout?",
-        QMessageBox::Yes | QMessageBox::No);
-    
-    if (reply == QMessageBox::Yes) {
-        loggedIn_ = false;
-        currentUser_.reset();
-        updateState();
-        statusBar()->showMessage("Logged out", 3000);
+        if (reply == QMessageBox::Yes) {
+            loggedIn_ = false;
+            currentUser_.reset();
+            updateState();
+            statusBar()->showMessage("Logged out", 3000);
+        }
+    } else {
+        // Handle login
+        if (!connected_) {
+            QMessageBox::warning(this, "Not Connected",
+                "Please connect to the database first via Settings > Database Configuration.");
+            return;
+        }
+
+        LoginDialog dialog(db_.get(), this);
+
+        if (dialog.exec() == QDialog::Accepted) {
+            currentUser_ = dialog.authenticatedUser();
+            loggedIn_ = true;
+
+            QMessageBox::information(this, "Login Successful",
+                QString("Welcome, %1!").arg(currentUser_->user.fullName));
+
+            updateState();
+        }
     }
 }
 

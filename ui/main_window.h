@@ -34,8 +34,7 @@ protected:
     void closeEvent(QCloseEvent* event) override;
 
 protected slots:
-    void onLogin();
-    void onLogout();
+    void onLoginLogout();
     void onConfig();
     void onAbout();
     void onConnectionLost();
@@ -55,8 +54,7 @@ protected:
     std::unique_ptr<DbService> db_;
     
     // UI components
-    QAction* loginAction_ = nullptr;
-    QAction* logoutAction_ = nullptr;
+    QAction* loginLogoutAction_ = nullptr;
     QAction* refreshAction_ = nullptr;
     QPushButton* refreshStatsBtn_ = nullptr;
     QLabel* statsLabel_ = nullptr;
