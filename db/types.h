@@ -21,6 +21,7 @@ using BoxId = qint64;
 using PalletId = qint64;
 using ProductionLineId = qint64;
 using ExportDocumentId = qint64;
+using ImportDocumentId = qint64;
 using ProductId = qint64;
 using ProductPackagingId = qint64;
 using PackagePalletId = qint64;
@@ -194,8 +195,19 @@ struct Pallet {
     PalletStatus status = PalletStatus::New;
     ProductionLineId productionLine = 0;
     QDateTime createdAt;
-    
+
     QString statusString() const { return palletStatusToString(status); }
+};
+
+struct ImportDocument {
+    ImportDocumentId id = 0;
+    QString filePath;
+    QDateTime importedAt;
+    UserId importedBy = 0;
+    QString importedByUsername;
+    ProductionLineId productionLine = 0;
+    int recordCount = 0;
+    QString status; // "Completed", "Failed", etc.
 };
 
 struct ExportDocument {
@@ -215,16 +227,17 @@ struct ExportDocument {
 // ============================================================================
 
 struct ImportResult {
+    ImportDocumentId documentId = 0;
     int totalRecords = 0;
     int importedCount = 0;
     int skippedCount = 0;
     int errorCount = 0;
     QStringList errors;
-    
+
     bool success() const { 
         return errorCount == 0 && errors.isEmpty(); 
     }
-    
+
     QString summary() const {
         return QString("Total: %1, Imported: %2, Skipped: %3, Errors: %4")
             .arg(totalRecords)

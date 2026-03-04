@@ -109,13 +109,29 @@ public:
     // =========================================================================
     // Import Operations (ASYNC)
     // =========================================================================
-    
+
     QFuture<ImportResult> importItemsAsync(const QString& filePath, 
-                                            ProductionLineId lineId);
+                                            ProductionLineId lineId,
+                                            UserId userId);
     QFuture<ImportResult> importBoxesAsync(const QString& filePath,
-                                            ProductionLineId lineId);
+                                            ProductionLineId lineId,
+                                            UserId userId);
     QFuture<ImportResult> importPalletsAsync(const QString& filePath,
-                                              ProductionLineId lineId);
+                                              ProductionLineId lineId,
+                                              UserId userId);
+
+    // Import Document Management (SYNC)
+    QVector<ImportDocument> getItemsImportDocuments(ProductionLineId lineId = 0, int limit = 50);
+    QVector<ImportDocument> getBoxesImportDocuments(ProductionLineId lineId = 0, int limit = 50);
+    QVector<ImportDocument> getPalletsImportDocuments(ProductionLineId lineId = 0, int limit = 50);
+    bool deleteItemsImportDocument(ImportDocumentId docId);
+    bool deleteBoxesImportDocument(ImportDocumentId docId);
+    bool deletePalletsImportDocument(ImportDocumentId docId);
+
+    // Import Document Deletion (ASYNC)
+    QFuture<bool> deleteItemsImportDocumentAsync(ImportDocumentId docId);
+    QFuture<bool> deleteBoxesImportDocumentAsync(ImportDocumentId docId);
+    QFuture<bool> deletePalletsImportDocumentAsync(ImportDocumentId docId);
 
     // =========================================================================
     // Item Operations (SYNC)
@@ -232,13 +248,23 @@ signals:
     void connectionLost();
     void connectionRestored();
     void importProgress(int current, int total);
+    void deleteProgress(int current, int total);
 
 private:
     bool ensureConnected();
-    
+
     // Import helpers
     ImportResult doImport(const QString& filePath, ProductionLineId lineId,
-                          const QString& tableName);
+                          const QString& tableName, const QString& importTableName,
+                          UserId userId);
+
+    // Delete helpers
+    bool doDeleteImportDocument(ImportDocumentId docId, const QString& tableName,
+                                const QString& importTableName, const QString& junctionTableName,
+                                const QString& entityIdCol);
+
+    // Schema helpers
+    bool ensureSoftDeleteColumns(QSqlDatabase& db, const QString& tableName);
     
     // Export helpers
     ExportResult doExportItems(const QVector<ItemId>& itemIds, const QString& lpTin);
@@ -256,6 +282,7 @@ private:
     Item parseItem(const QSqlQuery& query);
     Box parseBox(const QSqlQuery& query);
     Pallet parsePallet(const QSqlQuery& query);
+    ImportDocument parseImportDocument(const QSqlQuery& query);
     ExportDocument parseExportDocument(const QSqlQuery& query);
     Product parseProduct(const QSqlQuery& query);
     ProductPackaging parseProductPackaging(const QSqlQuery& query);

@@ -320,23 +320,26 @@ std::optional<ProductionLine> DbService::getProductionLine(ProductionLineId id) 
 // ============================================================================
 
 QFuture<ImportResult> DbService::importItemsAsync(const QString& filePath,
-                                                   ProductionLineId lineId) {
-    return QtConcurrent::run([this, filePath, lineId]() {
-        return doImport(filePath, lineId, "items");
+                                                   ProductionLineId lineId,
+                                                   UserId userId) {
+    return QtConcurrent::run([this, filePath, lineId, userId]() {
+        return doImport(filePath, lineId, "items", "items_import_docs", userId);
     });
 }
 
 QFuture<ImportResult> DbService::importBoxesAsync(const QString& filePath,
-                                                   ProductionLineId lineId) {
-    return QtConcurrent::run([this, filePath, lineId]() {
-        return doImport(filePath, lineId, "boxes");
+                                                   ProductionLineId lineId,
+                                                   UserId userId) {
+    return QtConcurrent::run([this, filePath, lineId, userId]() {
+        return doImport(filePath, lineId, "boxes", "boxes_import_docs", userId);
     });
 }
 
 QFuture<ImportResult> DbService::importPalletsAsync(const QString& filePath,
-                                                     ProductionLineId lineId) {
-    return QtConcurrent::run([this, filePath, lineId]() {
-        return doImport(filePath, lineId, "pallets");
+                                                     ProductionLineId lineId,
+                                                     UserId userId) {
+    return QtConcurrent::run([this, filePath, lineId, userId]() {
+        return doImport(filePath, lineId, "pallets", "pallets_import_docs", userId);
     });
 }
 
@@ -349,7 +352,7 @@ QSqlDatabase DbService::createThreadLocalConnection(const QString& host, int por
     QString threadConnName = QString("thread_%1_%2")
         .arg(quintptr(QThread::currentThread()), 0, 16)
         .arg(QRandomGenerator::global()->generate(), 0, 16);
-    
+
     // Create connection for this thread
     QSqlDatabase db = QSqlDatabase::addDatabase("QPSQL", threadConnName);
     db.setHostName(host);
@@ -358,17 +361,58 @@ QSqlDatabase DbService::createThreadLocalConnection(const QString& host, int por
     db.setUserName(user);
     db.setPassword(password);
     db.setConnectOptions("connect_timeout=10");
-    
+
     if (!db.open()) {
         qWarning() << "Failed to open thread-local DB connection:" << db.lastError().text();
         return QSqlDatabase();
     }
-    
+
     return db;
 }
 
+// Helper: Ensure soft delete columns exist on entity table
+// TODO: Add background cleanup job to periodically DELETE FROM table WHERE is_deleted = true AND deleted_at < NOW() - INTERVAL '7 days'
+bool DbService::ensureSoftDeleteColumns(QSqlDatabase& db, const QString& tableName) {
+    QSqlQuery query(db);
+
+    // Add is_deleted column if not exists
+    QString addIsDeletedSql = QString(
+        "ALTER TABLE %1 ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT false"
+    ).arg(tableName);
+
+    if (!query.exec(addIsDeletedSql)) {
+        qWarning() << "Failed to add is_deleted column to" << tableName << ":" << query.lastError().text();
+        return false;
+    }
+
+    // Add deleted_at column if not exists
+    QString addDeletedAtSql = QString(
+        "ALTER TABLE %1 ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL"
+    ).arg(tableName);
+
+    if (!query.exec(addDeletedAtSql)) {
+        qWarning() << "Failed to add deleted_at column to" << tableName << ":" << query.lastError().text();
+        return false;
+    }
+
+    // Create partial index for fast queries on active records (if not exists)
+    // This ensures queries with "WHERE is_deleted = false" use index efficiently
+    QString timestampCol = (tableName == "pallets") ? "created_at" : "imported_at";
+    QString createIndexSql = QString(
+        "CREATE INDEX IF NOT EXISTS idx_%1_active_status ON %1 (status, %2) WHERE is_deleted = false"
+    ).arg(tableName, timestampCol);
+
+    if (!query.exec(createIndexSql)) {
+        qWarning() << "Failed to create partial index on" << tableName << ":" << query.lastError().text();
+        // Non-fatal - continue without index
+    }
+
+    return true;
+}
+
 ImportResult DbService::doImport(const QString& filePath, ProductionLineId lineId,
-                               const QString& tableName) {
+                               const QString& tableName, const QString& importTableName,
+                               UserId userId) {
 ImportResult result;
     
 // Read CSV file with explicit UTF-8 encoding to preserve GS1 control characters
@@ -421,59 +465,514 @@ if (!db.isOpen()) {
     result.errors.append("Failed to create database connection: Driver not loaded or connection failed");
     return result;
  }
-    
+
     QString timestampCol = (tableName == "pallets") ? "created_at" : "imported_at";
-    
-    // Process in batches
-    const int batchSize = 500;
+
+    // Ensure soft delete columns exist on main entity table
+    if (!ensureSoftDeleteColumns(db, tableName)) {
+        result.errors.append("Failed to setup soft delete columns on " + tableName);
+        return result;
+    }
+
+    // Create import documents table if it doesn't exist
+    QString createTableSql = QString(
+        "CREATE TABLE IF NOT EXISTS %1 ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "file_path TEXT NOT NULL, "
+        "imported_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(), "
+        "imported_by BIGINT NOT NULL, "
+        "production_line BIGINT NOT NULL, "
+        "record_count INT NOT NULL, "
+        "status TEXT NOT NULL, "
+        "FOREIGN KEY (imported_by) REFERENCES users(id) ON DELETE CASCADE, "
+        "FOREIGN KEY (production_line) REFERENCES production_lines(id) ON DELETE CASCADE"
+        ")"
+    ).arg(importTableName);
+
+    QSqlQuery createTableQuery(db);
+    if (!createTableQuery.exec(createTableSql)) {
+        result.errors.append("Failed to create import documents table: " + createTableQuery.lastError().text());
+        return result;
+    }
+
+    // Create junction table for tracking which items/boxes/pallets belong to which import document
+    QString junctionTableName = importTableName + "_" + tableName;
+    QString entityIdCol = tableName.left(tableName.length() - 1) + "_id"; // items -> item_id, boxes -> boxe_id, pallets -> pallet_id
+    if (tableName == "boxes") {
+        entityIdCol = "box_id";
+    }
+
+    QString createJunctionSql = QString(
+        "CREATE TABLE IF NOT EXISTS %1 ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "import_doc_id BIGINT NOT NULL, "
+        "%2 BIGINT NOT NULL, "
+        "FOREIGN KEY (import_doc_id) REFERENCES %3(id) ON DELETE CASCADE, "
+        "FOREIGN KEY (%2) REFERENCES %4(id) ON DELETE CASCADE"
+        ")"
+    ).arg(junctionTableName, entityIdCol, importTableName, tableName);
+
+    QSqlQuery createJunctionQuery(db);
+    if (!createJunctionQuery.exec(createJunctionSql)) {
+        result.errors.append("Failed to create junction table: " + createJunctionQuery.lastError().text());
+        return result;
+    }
+
+    // Process in batches - dynamic batch size = 5% of total for smooth progress (20 updates)
+    const int batchSize = qMax(100, static_cast<int>(barcodes.size() * 0.01)); // Min 100, max 5% of total
     int processed = 0;
-    
+
+    // Store imported IDs for later junction table insert
+    QVector<qint64> allImportedIds;
+
     db.transaction();
-    
+
     for (int i = 0; i < barcodes.size(); i += batchSize) {
         QStringList batch = barcodes.mid(i, qMin(batchSize, barcodes.size() - i));
-        
-        // Build parameterized query with placeholders
+
+        // Step 1: Restore any soft-deleted records with matching barcodes
+        // Build IN clause for batch
+        QStringList quotedBarcodes;
+        for (const QString& bc : batch) {
+            // Escape single quotes in barcode for SQL safety
+            QString escaped = bc;
+            escaped.replace("'", "''");
+            quotedBarcodes.append(QString("'%1'").arg(escaped));
+        }
+        QString barcodeList = quotedBarcodes.join(",");
+
+        // Restore soft-deleted records and get their IDs
+        QString restoreSql = QString(
+            "UPDATE %1 SET is_deleted = false, deleted_at = NULL, status = 0, %2 = NOW() "
+            "WHERE bar_code IN (%3) AND is_deleted = true "
+            "RETURNING id"
+        ).arg(tableName, timestampCol, barcodeList);
+
+        QSqlQuery restoreQuery(db);
+        int restoredCount = 0;
+        if (restoreQuery.exec(restoreSql)) {
+            while (restoreQuery.next()) {
+                allImportedIds.append(restoreQuery.value(0).toLongLong());
+                restoredCount++;
+            }
+        }
+
+        // Step 2: Insert truly new records (not existing at all)
         QStringList valuePlaceholders;
         for (int j = 0; j < batch.size(); ++j) {
-            valuePlaceholders.append(QString("(:bc%1, :lineId, 0, NOW())").arg(j));
+            valuePlaceholders.append(QString("(:bc%1, :lineId, 0, NOW(), false)").arg(j));
         }
-        
-        QString sql = QString(
-            "INSERT INTO %1 (bar_code, production_line, status, %2) "
-            "VALUES %3 ON CONFLICT (bar_code) DO NOTHING"
+
+        QString insertSql = QString(
+            "INSERT INTO %1 (bar_code, production_line, status, %2, is_deleted) "
+            "VALUES %3 ON CONFLICT (bar_code) DO NOTHING RETURNING id"
         ).arg(tableName, timestampCol, valuePlaceholders.join(", "));
-        
-        QSqlQuery query(db);
-        query.prepare(sql);
-        
+
+        QSqlQuery insertQuery(db);
+        insertQuery.prepare(insertSql);
+
         // Bind each barcode value safely
         for (int j = 0; j < batch.size(); ++j) {
-            query.bindValue(QString(":bc%1").arg(j), batch[j]);
+            insertQuery.bindValue(QString(":bc%1").arg(j), batch[j]);
         }
-        query.bindValue(":lineId", lineId);
-        
-        if (query.exec()) {
-            int affected = query.numRowsAffected();
-            result.importedCount += affected;
-            result.skippedCount += batch.size() - affected;
+        insertQuery.bindValue(":lineId", lineId);
+
+        int insertedCount = 0;
+        if (insertQuery.exec()) {
+            // Collect inserted IDs
+            while (insertQuery.next()) {
+                allImportedIds.append(insertQuery.value(0).toLongLong());
+                insertedCount++;
+            }
         } else {
             result.errorCount += batch.size();
-            result.errors.append(query.lastError().text());
+            result.errors.append(insertQuery.lastError().text());
         }
-        
+
+        // Total imported = restored + newly inserted
+        int batchImported = restoredCount + insertedCount;
+        result.importedCount += batchImported;
+        result.skippedCount += batch.size() - batchImported;
+
         processed += batch.size();
         emit importProgress(processed, result.totalRecords);
     }
-    
-if (result.errorCount == 0) {
+
+// Check if any records were actually imported
+if (result.errorCount == 0 && result.importedCount > 0) {
+    // Create import document record
+    QSqlQuery createDocQuery(db);
+    createDocQuery.prepare(QString(
+        "INSERT INTO %1 (file_path, imported_by, production_line, record_count, status) "
+        "VALUES (:filePath, :userId, :lineId, :recordCount, :status) RETURNING id"
+    ).arg(importTableName));
+    createDocQuery.bindValue(":filePath", filePath);
+    createDocQuery.bindValue(":userId", userId);
+    createDocQuery.bindValue(":lineId", lineId);
+    createDocQuery.bindValue(":recordCount", result.importedCount);
+    createDocQuery.bindValue(":status", "Completed");
+
+    if (!createDocQuery.exec() || !createDocQuery.next()) {
+        db.rollback();
+        result.errors.append("Failed to create import document: " + createDocQuery.lastError().text());
+        return result;
+    }
+
+    result.documentId = createDocQuery.value(0).toLongLong();
+
+    // Insert into junction table in batches for performance - dynamic batch size = 5% of total
+    const int junctionBatchSize = qMax(1000, static_cast<int>(allImportedIds.size() * 0.01)); // Min 1000, max 5% of total
+    int junctionProcessed = 0;
+
+    for (int i = 0; i < allImportedIds.size(); i += junctionBatchSize) {
+        int currentBatch = qMin(junctionBatchSize, allImportedIds.size() - i);
+        QStringList valuePairs;
+
+        for (int j = 0; j < currentBatch; ++j) {
+            valuePairs.append(QString("(%1, %2)")
+                .arg(result.documentId)
+                .arg(allImportedIds[i + j]));
+        }
+
+        QString junctionSql = QString(
+            "INSERT INTO %1 (import_doc_id, %2) VALUES %3"
+        ).arg(junctionTableName, entityIdCol, valuePairs.join(", "));
+
+        QSqlQuery junctionQuery(db);
+        if (!junctionQuery.exec(junctionSql)) {
+            qWarning() << "Failed to insert junction batch:" << junctionQuery.lastError().text();
+        }
+
+        junctionProcessed += currentBatch;
+        // Report junction progress (offset from main import progress)
+        emit importProgress(result.totalRecords + junctionProcessed, 
+                          result.totalRecords + allImportedIds.size());
+    }
+
     db.commit();
+} else if (result.errorCount > 0) {
+    db.rollback();
 } else {
+    // No records imported (all duplicates), rollback without error
     db.rollback();
 }
     
 qDebug() << "DbService: Import complete -" << result.summary();
 return result;
+}
+
+// ============================================================================
+// Import Document Management
+// ============================================================================
+
+QVector<ImportDocument> DbService::getItemsImportDocuments(ProductionLineId lineId, int limit) {
+    QVector<ImportDocument> docs;
+    if (!ensureConnected()) return docs;
+
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+
+    QString sql = 
+        "SELECT d.id, d.file_path, d.imported_at, d.imported_by, d.production_line, "
+        "       d.record_count, d.status, u.username "
+        "FROM items_import_docs d "
+        "LEFT JOIN users u ON d.imported_by = u.id ";
+
+    if (lineId > 0) {
+        sql += "WHERE d.production_line = :lineId ";
+    }
+    sql += "ORDER BY d.imported_at DESC LIMIT :limit";
+
+    query.prepare(sql);
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    query.bindValue(":limit", limit);
+
+    if (query.exec()) {
+        while (query.next()) {
+            docs.append(parseImportDocument(query));
+        }
+    }
+
+    return docs;
+}
+
+QVector<ImportDocument> DbService::getBoxesImportDocuments(ProductionLineId lineId, int limit) {
+    QVector<ImportDocument> docs;
+    if (!ensureConnected()) return docs;
+
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+
+    QString sql = 
+        "SELECT d.id, d.file_path, d.imported_at, d.imported_by, d.production_line, "
+        "       d.record_count, d.status, u.username "
+        "FROM boxes_import_docs d "
+        "LEFT JOIN users u ON d.imported_by = u.id ";
+
+    if (lineId > 0) {
+        sql += "WHERE d.production_line = :lineId ";
+    }
+    sql += "ORDER BY d.imported_at DESC LIMIT :limit";
+
+    query.prepare(sql);
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    query.bindValue(":limit", limit);
+
+    if (query.exec()) {
+        while (query.next()) {
+            docs.append(parseImportDocument(query));
+        }
+    }
+
+    return docs;
+}
+
+QVector<ImportDocument> DbService::getPalletsImportDocuments(ProductionLineId lineId, int limit) {
+    QVector<ImportDocument> docs;
+    if (!ensureConnected()) return docs;
+
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+
+    QString sql = 
+        "SELECT d.id, d.file_path, d.imported_at, d.imported_by, d.production_line, "
+        "       d.record_count, d.status, u.username "
+        "FROM pallets_import_docs d "
+        "LEFT JOIN users u ON d.imported_by = u.id ";
+
+    if (lineId > 0) {
+        sql += "WHERE d.production_line = :lineId ";
+    }
+    sql += "ORDER BY d.imported_at DESC LIMIT :limit";
+
+    query.prepare(sql);
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    query.bindValue(":limit", limit);
+
+    if (query.exec()) {
+        while (query.next()) {
+            docs.append(parseImportDocument(query));
+        }
+    }
+
+    return docs;
+}
+
+// ============================================================================
+// Import Document Deletion (ASYNC)
+// ============================================================================
+
+QFuture<bool> DbService::deleteItemsImportDocumentAsync(ImportDocumentId docId) {
+    return QtConcurrent::run([this, docId]() {
+        return doDeleteImportDocument(docId, "items", "items_import_docs", 
+                                     "items_import_docs_items", "item_id");
+    });
+}
+
+QFuture<bool> DbService::deleteBoxesImportDocumentAsync(ImportDocumentId docId) {
+    return QtConcurrent::run([this, docId]() {
+        return doDeleteImportDocument(docId, "boxes", "boxes_import_docs", 
+                                     "boxes_import_docs_boxes", "box_id");
+    });
+}
+
+QFuture<bool> DbService::deletePalletsImportDocumentAsync(ImportDocumentId docId) {
+    return QtConcurrent::run([this, docId]() {
+        return doDeleteImportDocument(docId, "pallets", "pallets_import_docs", 
+                                     "pallets_import_docs_pallets", "pallet_id");
+    });
+}
+
+bool DbService::doDeleteImportDocument(ImportDocumentId docId, const QString& tableName,
+                                      const QString& importTableName, 
+                                      const QString& junctionTableName,
+                                      const QString& entityIdCol) {
+    // Create thread-local database connection for async operation
+    QString dbHost, dbDatabase, dbUser, dbPassword;
+    int dbPort = 5432;
+    {
+        QMutexLocker locker(&mutex_);
+        dbHost = config_.host;
+        dbPort = config_.port;
+        dbDatabase = config_.database;
+        dbUser = config_.user;
+        dbPassword = config_.password;
+    }
+
+    QSqlDatabase db = createThreadLocalConnection(dbHost, dbPort, 
+                                                   dbDatabase, dbUser, dbPassword);
+
+    if (!db.isOpen()) {
+        QMutexLocker locker(&mutex_);
+        lastError_ = "Failed to create database connection";
+        return false;
+    }
+
+    db.transaction();
+    emit deleteProgress(0, 100);
+
+    // Ensure soft delete columns exist
+    if (!ensureSoftDeleteColumns(db, tableName)) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = "Failed to setup soft delete columns";
+        return false;
+    }
+
+    emit deleteProgress(5, 100); // 5% - schema ready
+
+    // Step 1: Get count of entities to soft-delete (fast COUNT query)
+    QSqlQuery countQuery(db);
+    QString countSql = QString(
+        "SELECT COUNT(*) FROM %1 WHERE import_doc_id = %2"
+    ).arg(junctionTableName).arg(docId);
+
+    if (!countQuery.exec(countSql) || !countQuery.next()) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = "Failed to count entities";
+        return false;
+    }
+
+    int totalCount = countQuery.value(0).toInt();
+
+    if (totalCount == 0) {
+        // No entities to delete, just delete the document
+        QSqlQuery deleteDocQuery(db);
+        deleteDocQuery.prepare(QString("DELETE FROM %1 WHERE id = :id").arg(importTableName));
+        deleteDocQuery.bindValue(":id", docId);
+
+        if (!deleteDocQuery.exec()) {
+            db.rollback();
+            QMutexLocker locker(&mutex_);
+            lastError_ = deleteDocQuery.lastError().text();
+            return false;
+        }
+
+        db.commit();
+        emit deleteProgress(100, 100);
+        return true;
+    }
+
+    emit deleteProgress(10, 100); // 10% - count complete
+
+    // Step 2: Check if any entities have been exported using junction table join
+    QSqlQuery checkQuery(db);
+    QString checkSql = QString(
+        "SELECT COUNT(*) FROM %1 t "
+        "INNER JOIN %2 j ON t.id = j.%3 "
+        "WHERE j.import_doc_id = %4 AND t.status = 2 AND t.is_deleted = false"
+    ).arg(tableName, junctionTableName, entityIdCol).arg(docId);
+
+    if (!checkQuery.exec(checkSql) || !checkQuery.next()) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = "Failed to check export status";
+        return false;
+    }
+
+    if (checkQuery.value(0).toInt() > 0) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = QString("Cannot delete import: some %1 have been exported").arg(tableName);
+        return false;
+    }
+
+    emit deleteProgress(20, 100); // 20% - validation complete
+
+    // Step 3: SOFT DELETE - Mark entities as deleted in batches for progress tracking
+    // Even though UPDATE is fast, batching allows us to show real progress for large datasets
+    // TODO: Add background cleanup job to periodically DELETE FROM table WHERE is_deleted = true AND deleted_at < NOW() - INTERVAL '7 days'
+
+    // Fetch entity IDs in chunks and update in batches
+    QSqlQuery fetchIdsQuery(db);
+    QString fetchIdsSql = QString(
+        "SELECT %1 FROM %2 WHERE import_doc_id = %3"
+    ).arg(entityIdCol, junctionTableName).arg(docId);
+
+    if (!fetchIdsQuery.exec(fetchIdsSql)) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = "Failed to fetch entity IDs for deletion";
+        return false;
+    }
+
+    QVector<qint64> entityIds;
+    while (fetchIdsQuery.next()) {
+        entityIds.append(fetchIdsQuery.value(0).toLongLong());
+    }
+
+    // Update in batches to show progress - dynamic batch size = 5% of total for smooth progress (20 updates)
+    const int batchSize = qMax(100, static_cast<int>(entityIds.size() * 0.01)); // Min 100, max 5% of total
+    int updated = 0;
+
+    for (int i = 0; i < entityIds.size(); i += batchSize) {
+        int currentBatchSize = qMin(batchSize, entityIds.size() - i);
+        QStringList batchIds;
+
+        for (int j = 0; j < currentBatchSize; ++j) {
+            batchIds.append(QString::number(entityIds[i + j]));
+        }
+
+        QString softDeleteSql = QString(
+            "UPDATE %1 SET is_deleted = true, deleted_at = NOW() "
+            "WHERE id IN (%2) AND is_deleted = false"
+        ).arg(tableName, batchIds.join(","));
+
+        QSqlQuery softDeleteQuery(db);
+        if (!softDeleteQuery.exec(softDeleteSql)) {
+            db.rollback();
+            QMutexLocker locker(&mutex_);
+            lastError_ = softDeleteQuery.lastError().text();
+            return false;
+        }
+
+        updated += currentBatchSize;
+        // Progress from 20% to 80% based on deletion progress
+        int progressPercent = 20 + (updated * 60 / entityIds.size()); // 20% to 80%
+        emit deleteProgress(progressPercent, 100);
+    }
+
+    int affectedRows = updated;
+    emit deleteProgress(80, 100); // 80% - entities soft-deleted
+
+    // Step 4: Delete the import document (cascade will delete junction records)
+    QSqlQuery deleteDocQuery(db);
+    deleteDocQuery.prepare(QString("DELETE FROM %1 WHERE id = :id").arg(importTableName));
+    deleteDocQuery.bindValue(":id", docId);
+
+    if (!deleteDocQuery.exec()) {
+        db.rollback();
+        QMutexLocker locker(&mutex_);
+        lastError_ = deleteDocQuery.lastError().text();
+        return false;
+    }
+
+    db.commit();
+    emit deleteProgress(100, 100); // 100% - complete
+    qDebug() << "DbService: Soft-deleted import document" << docId << "with" << affectedRows << tableName;
+    return true;
+}
+
+bool DbService::deleteItemsImportDocument(ImportDocumentId docId) {
+    return doDeleteImportDocument(docId, "items", "items_import_docs", 
+                                 "items_import_docs_items", "item_id");
+}
+
+bool DbService::deleteBoxesImportDocument(ImportDocumentId docId) {
+    return doDeleteImportDocument(docId, "boxes", "boxes_import_docs", 
+                                 "boxes_import_docs_boxes", "box_id");
+}
+
+bool DbService::deletePalletsImportDocument(ImportDocumentId docId) {
+    return doDeleteImportDocument(docId, "pallets", "pallets_import_docs", 
+                                 "pallets_import_docs_pallets", "pallet_id");
 }
 
 // ============================================================================
@@ -487,7 +986,7 @@ std::optional<Item> DbService::getItem(ItemId id) {
     QSqlQuery query(db);
     query.prepare(
         "SELECT id, bar_code, status, production_line, imported_at, scanned_at "
-        "FROM items WHERE id = :id"
+        "FROM items WHERE id = :id AND is_deleted = false"
     );
     query.bindValue(":id", id);
     
@@ -509,7 +1008,7 @@ QVector<Item> DbService::getItemsByStatus(ItemStatus status, ProductionLineId li
     
     QString sql = 
         "SELECT id, bar_code, status, production_line, imported_at, scanned_at "
-        "FROM items WHERE status = :status";
+        "FROM items WHERE status = :status AND is_deleted = false";
     
     if (lineId > 0) {
         sql += " AND production_line = :lineId";
@@ -544,7 +1043,7 @@ QVector<Item> DbService::getItemsInBox(BoxId boxId) {
         "FROM items i "
         "JOIN item_box_assignments iba ON i.id = iba.item_id "
         "JOIN boxes b ON iba.box_id = b.id "
-        "WHERE b.id = :boxId ORDER BY iba.assigned_at"
+        "WHERE b.id = :boxId AND i.is_deleted = false ORDER BY iba.assigned_at"
     );
     query.bindValue(":boxId", boxId);
     
@@ -569,7 +1068,7 @@ QVector<Item> DbService::getScannedItemsNotInBox(ProductionLineId lineId, int li
         "SELECT i.id, i.bar_code, i.status, i.production_line, i.imported_at, i.scanned_at "
         "FROM items i "
         "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
-        "WHERE i.status = 1 AND iba.item_id IS NULL";
+        "WHERE i.status = 1 AND iba.item_id IS NULL AND i.is_deleted = false";
 
     if (lineId > 0) {
         sql += QString(" AND i.production_line = %1").arg(lineId);
@@ -597,7 +1096,7 @@ int DbService::countScannedItemsNotInBox(ProductionLineId lineId) {
     QString sql = 
         "SELECT COUNT(*) FROM items i "
         "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
-        "WHERE i.status = 1 AND iba.item_id IS NULL";
+        "WHERE i.status = 1 AND iba.item_id IS NULL AND i.is_deleted = false";
     
     if (lineId > 0) {
         sql += " AND i.production_line = :lineId";
@@ -623,7 +1122,7 @@ bool DbService::assignItemToBox(ItemId itemId, BoxId boxId) {
     
     // Verify box exists and is empty (status = 0)
     QSqlQuery boxQuery(db);
-    boxQuery.prepare("SELECT id, status FROM boxes WHERE id = :id");
+    boxQuery.prepare("SELECT id, status FROM boxes WHERE id = :id AND is_deleted = false");
     boxQuery.bindValue(":id", boxId);
     
     if (!boxQuery.exec() || !boxQuery.next()) {
@@ -642,7 +1141,7 @@ bool DbService::assignItemToBox(ItemId itemId, BoxId boxId) {
     
     // Verify item exists and is available (status = 0)
     QSqlQuery itemQuery(db);
-    itemQuery.prepare("SELECT id, status FROM items WHERE id = :id");
+    itemQuery.prepare("SELECT id, status FROM items WHERE id = :id AND is_deleted = false");
     itemQuery.bindValue(":id", itemId);
     
     if (!itemQuery.exec() || !itemQuery.next()) {
@@ -712,7 +1211,7 @@ std::optional<Box> DbService::getBox(BoxId id) {
     QSqlQuery query(db);
     query.prepare(
         "SELECT id, bar_code, status, production_line, imported_at, sealed_at "
-        "FROM boxes WHERE id = :id"
+        "FROM boxes WHERE id = :id AND is_deleted = false"
     );
     query.bindValue(":id", id);
     
@@ -734,7 +1233,7 @@ QVector<Box> DbService::getBoxesByStatus(BoxStatus status, ProductionLineId line
 
     QString sql = QString(
         "SELECT id, bar_code, status, production_line, imported_at, sealed_at "
-        "FROM boxes WHERE status = %1").arg(static_cast<int>(status));
+        "FROM boxes WHERE status = %1 AND is_deleted = false").arg(static_cast<int>(status));
 
     if (lineId > 0) {
         sql += QString(" AND production_line = %1").arg(lineId);
@@ -765,7 +1264,7 @@ QVector<Box> DbService::getSealedBoxesNotOnPallet(ProductionLineId lineId, int l
         "SELECT b.id, b.bar_code, b.status, b.production_line, b.imported_at, b.sealed_at "
         "FROM boxes b "
         "LEFT JOIN pallet_box_assignments pba ON b.id = pba.box_id "
-        "WHERE b.status = 1 AND pba.box_id IS NULL";
+        "WHERE b.status = 1 AND pba.box_id IS NULL AND b.is_deleted = false";
 
     if (lineId > 0) {
         sql += QString(" AND b.production_line = %1").arg(lineId);
@@ -793,7 +1292,7 @@ int DbService::countSealedBoxesNotOnPallet(ProductionLineId lineId) {
     QString sql = 
         "SELECT COUNT(*) FROM boxes b "
         "LEFT JOIN pallet_box_assignments pba ON b.id = pba.box_id "
-        "WHERE b.status = 1 AND pba.box_id IS NULL";
+        "WHERE b.status = 1 AND pba.box_id IS NULL AND b.is_deleted = false";
     
     if (lineId > 0) {
         sql += " AND b.production_line = :lineId";
@@ -824,7 +1323,7 @@ QVector<Box> DbService::getBoxesOnPallet(PalletId palletId) {
         "FROM boxes b "
         "JOIN pallet_box_assignments pba ON b.id = pba.box_id "
         "JOIN pallets p ON pba.pallet_id = p.id "
-        "WHERE p.id = :palletId ORDER BY pba.assigned_at"
+        "WHERE p.id = :palletId AND b.is_deleted = false ORDER BY pba.assigned_at"
     );
     query.bindValue(":palletId", palletId);
     
@@ -880,7 +1379,7 @@ bool DbService::assignBoxToPallet(BoxId boxId, PalletId palletId) {
     
     // Verify pallet exists and is new (status = 0)
     QSqlQuery palletQuery(db);
-    palletQuery.prepare("SELECT id, status FROM pallets WHERE id = :id");
+    palletQuery.prepare("SELECT id, status FROM pallets WHERE id = :id AND is_deleted = false");
     palletQuery.bindValue(":id", palletId);
     
     if (!palletQuery.exec() || !palletQuery.next()) {
@@ -899,23 +1398,23 @@ bool DbService::assignBoxToPallet(BoxId boxId, PalletId palletId) {
     
     // Verify box exists and is sealed (status = 1)
     QSqlQuery boxQuery(db);
-    boxQuery.prepare("SELECT id, status FROM boxes WHERE id = :id");
+    boxQuery.prepare("SELECT id, status FROM boxes WHERE id = :id AND is_deleted = false");
     boxQuery.bindValue(":id", boxId);
-    
+
     if (!boxQuery.exec() || !boxQuery.next()) {
         db.rollback();
         QMutexLocker locker(&mutex_);
         lastError_ = "Box not found";
         return false;
     }
-    
+
     if (boxQuery.value(1).toInt() != 1) {
         db.rollback();
         QMutexLocker locker(&mutex_);
         lastError_ = "Box must be Sealed";
         return false;
     }
-    
+
     // Create assignment
     QSqlQuery assignQuery(db);
     assignQuery.prepare(
@@ -964,7 +1463,7 @@ std::optional<Pallet> DbService::getPallet(PalletId id) {
     
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
-    query.prepare("SELECT id, bar_code, status, production_line, created_at FROM pallets WHERE id = :id");
+    query.prepare("SELECT id, bar_code, status, production_line, created_at FROM pallets WHERE id = :id AND is_deleted = false");
     query.bindValue(":id", id);
     
     if (query.exec() && query.next()) {
@@ -981,7 +1480,7 @@ QVector<Pallet> DbService::getPallets() {
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
 
-    if (query.exec("SELECT id, bar_code, status, production_line, created_at FROM pallets ORDER BY created_at DESC")) {
+    if (query.exec("SELECT id, bar_code, status, production_line, created_at FROM pallets WHERE is_deleted = false ORDER BY created_at DESC")) {
         while (query.next()) {
             pallets.append(parsePallet(query));
         }
@@ -1003,7 +1502,7 @@ QVector<Pallet> DbService::getPalletsByStatus(PalletStatus status, ProductionLin
     // Legacy schema: id, bar_code, production_line, status, created_at
     QString sql = QString(
         "SELECT id, bar_code, status, production_line, created_at "
-        "FROM pallets WHERE status = %1").arg(static_cast<int>(status));
+        "FROM pallets WHERE status = %1 AND is_deleted = false").arg(static_cast<int>(status));
 
     if (lineId > 0) {
         sql += QString(" AND production_line = %1").arg(lineId);
@@ -1242,7 +1741,7 @@ ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QStr
     QString verifySql = QString(
         "SELECT COUNT(*) FROM items i "
         "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
-        "WHERE i.id IN (%1) AND i.status = 1 AND iba.item_id IS NULL"
+        "WHERE i.id IN (%1) AND i.status = 1 AND iba.item_id IS NULL AND i.is_deleted = false"
     ).arg(idList);
     
     if (!verifyQuery.exec(verifySql) || !verifyQuery.next()) {
@@ -1362,7 +1861,7 @@ QString idList = idStrings.join(",");
 // Verify boxes are sealed
 QSqlQuery verifyQuery(db);
 QString verifySql = QString(
-    "SELECT COUNT(*) FROM boxes WHERE id IN (%1) AND status = 1"
+    "SELECT COUNT(*) FROM boxes WHERE id IN (%1) AND status = 1 AND is_deleted = false"
 ).arg(idList);
     
 if (!verifyQuery.exec(verifySql) || !verifyQuery.next()) {
@@ -1513,7 +2012,7 @@ ExportResult DbService::doExportPallets(const QVector<PalletId>& palletIds, cons
     // Verify pallets are complete
     QSqlQuery verifyQuery(db);
     QString verifySql = QString(
-        "SELECT COUNT(*) FROM pallets WHERE id IN (%1) AND status = 1"
+        "SELECT COUNT(*) FROM pallets WHERE id IN (%1) AND status = 1 AND is_deleted = false"
     ).arg(idList);
     
     if (!verifyQuery.exec(verifySql) || !verifyQuery.next()) {
@@ -2404,6 +2903,19 @@ Pallet DbService::parsePallet(const QSqlQuery& query) {
     pallet.productionLine = query.value(3).toLongLong();
     pallet.createdAt = query.value(4).toDateTime();
     return pallet;
+}
+
+ImportDocument DbService::parseImportDocument(const QSqlQuery& query) {
+    ImportDocument doc;
+    doc.id = query.value(0).toLongLong();
+    doc.filePath = query.value(1).toString();
+    doc.importedAt = query.value(2).toDateTime();
+    doc.importedBy = query.value(3).toLongLong();
+    doc.productionLine = query.value(4).toLongLong();
+    doc.recordCount = query.value(5).toInt();
+    doc.status = query.value(6).toString();
+    doc.importedByUsername = query.value(7).toString();
+    return doc;
 }
 
 ExportDocument DbService::parseExportDocument(const QSqlQuery& query) {
