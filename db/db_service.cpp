@@ -498,6 +498,137 @@ std::optional<Item> DbService::getItem(ItemId id) {
     return std::nullopt;
 }
 
+QVector<Item> DbService::getItems(ItemId startId, const std::string& gtin, ItemStatus status, ProductionLineId lineId, int limit)
+{
+    if (gtin.empty() || !ensureConnected()) {
+        return {};
+    }
+    QVector<Item> items;
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+
+    QString sql =
+        "SELECT id, bar_code, status, production_line, imported_at, scanned_at "
+        "FROM items "
+        "WHERE id > :start AND status = :status AND bar_code LIKE :gtinPattern";
+
+    if (lineId > 0) {
+        sql += " AND production_line = :lineId";
+    }
+    sql += " ORDER BY imported_at";
+    if (limit > 0) {
+        sql += " LIMIT :limit";
+    }
+    query.prepare(sql);
+	query.bindValue(":start", startId);
+    query.bindValue(":status", static_cast<int>(status));
+    query.bindValue(":gtinPattern", "%" + QString::fromStdString(gtin) + "%");
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    if (limit > 0) {
+        query.bindValue(":limit", limit);
+    }
+    if (query.exec()) {
+        while (query.next()) {
+            items.append(parseItem(query));
+        }
+    } else {
+        qWarning() << "DbService::getItems failed:" << query.lastError().text();
+        qWarning() << "Query:" << sql;
+    }
+    return items;
+}
+
+QVector<Box> DbService::getBoxes(BoxId startId, const std::string& gtin, BoxStatus status, ProductionLineId lineId, int limit)
+{
+    if (gtin.empty() || !ensureConnected()) {
+        return {};
+    }
+    QVector<Box> boxes;
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+
+    QString sql =
+        "SELECT id, bar_code, status, production_line, imported_at, sealed_at "
+        "FROM boxes "
+        "WHERE id > :start AND status = :status AND bar_code LIKE :gtinPattern";
+
+    if (lineId > 0) {
+        sql += " AND production_line = :lineId";
+    }
+    sql += " ORDER BY imported_at";
+    if (limit > 0) {
+        sql += " LIMIT :limit";
+    }
+    query.prepare(sql);
+	query.bindValue(":start", startId);
+    query.bindValue(":status", static_cast<int>(status));
+    query.bindValue(":gtinPattern", "%" + QString::fromStdString(gtin) + "%");
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    if (limit > 0) {
+        query.bindValue(":limit", limit);
+    }
+    if (query.exec()) {
+        while (query.next()) {
+            boxes.append(parseBox(query));
+        }
+    } else {
+        qWarning() << "DbService::getBoxes failed:" << query.lastError().text();
+        qWarning() << "Query:" << sql;
+    }
+    return boxes;
+}
+
+QVector<Pallet> DbService::getPallets(PalletId startId, const std::string& gtin, PalletStatus status, ProductionLineId lineId, int limit)
+{
+    if (gtin.empty() || !ensureConnected()) {
+        return {};
+    }
+    QVector<Pallet> pallets;
+
+    QSqlDatabase db = getDatabase();
+    QSqlQuery query(db);
+
+    QString sql =
+        "SELECT id, bar_code, status, production_line, created_at "
+        "FROM pallets "
+        "WHERE id > :start AND status = :status AND bar_code LIKE :gtinPattern";
+
+    if (lineId > 0) {
+        sql += " AND production_line = :lineId";
+    }
+    sql += " ORDER BY created_at";
+    if (limit > 0) {
+        sql += " LIMIT :limit";
+    }
+
+    query.prepare(sql);
+	query.bindValue(":start", startId);
+    query.bindValue(":status", static_cast<int>(status));
+    query.bindValue(":gtinPattern", "%" + QString::fromStdString(gtin) + "%");
+    if (lineId > 0) {
+        query.bindValue(":lineId", lineId);
+    }
+    if (limit > 0) {
+        query.bindValue(":limit", limit);
+    }
+
+    if (query.exec()) {
+        while (query.next()) {
+            pallets.append(parsePallet(query));
+        }
+    }
+    else {
+        qWarning() << "DbService::getPalletsByStatus(gtin) failed:" << query.lastError().text();
+        qWarning() << "Query:" << sql;
+    }
+
+    return pallets;
+}
+
 QVector<Item> DbService::getItemsByStatus(ItemStatus status, ProductionLineId lineId,
                                            int limit) {
     QVector<Item> items;
@@ -2910,6 +3041,76 @@ bool DbService::completePallet(PalletId id) {
     query.bindValue(":id", id);
 
     return query.exec() && query.numRowsAffected() > 0;
+}
+
+// Add implementation (for example after createThreadLocalConnection)
+
+bool DbService::updateItemStatus(QSqlDatabase& db, ItemId itemId, ItemStatus s) 
+{
+    if (!db.isOpen() || !db.isValid()) {
+        return false;
+    }
+
+    QSqlQuery query(db);
+    query.prepare(
+        "UPDATE items "
+        "SET status = :stat, scanned_at = COALESCE(scanned_at, NOW()) "
+        "WHERE id = :id"
+    );
+	query.bindValue(":stat", static_cast<int>(s));
+    query.bindValue(":id", itemId);
+
+    return query.exec() && query.numRowsAffected() > 0;
+}
+
+bool DbService::assignItemsToBox(QSqlDatabase& db, const QVector<ItemId>& itemIds, BoxId boxId) {
+    if (!db.isOpen() || !db.isValid() || itemIds.isEmpty()) {
+        return false;
+    }
+
+    if (!db.transaction()) {
+        return false;
+    }
+
+    QSqlQuery insertQuery(db);
+    insertQuery.prepare(
+        "INSERT INTO item_box_assignments (item_id, box_id, assigned_at) "
+        "VALUES (:itemId, :boxId, NOW())"
+    );
+
+    for (ItemId itemId : itemIds) {
+        insertQuery.bindValue(":itemId", itemId);
+        insertQuery.bindValue(":boxId", boxId);
+
+        if (!insertQuery.exec()) {
+            db.rollback();
+            return false;
+        }
+    }
+    if (!db.commit()) {
+        db.rollback();
+        return false;
+    }
+
+    return true;
+}
+
+bool DbService::addBoxToPallet(QSqlDatabase& db, BoxId boxId, PalletId palletId)
+{
+    if (!db.isOpen() || !db.isValid()) {
+        return false;
+    }
+    QSqlQuery query(db);
+    query.prepare(
+        "INSERT INTO pallet_box_assignments (pallet_id, box_id, assigned_at) "
+        "VALUES (:palletId, :boxId, NOW())"
+    );
+    query.bindValue(":palletId", palletId);
+    query.bindValue(":boxId", boxId);
+    if (!query.exec()) {
+        return false;
+    }
+	return true;
 }
 
 } // namespace core

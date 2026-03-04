@@ -29,21 +29,27 @@ using PackagePalletId = qint64;
 // Enums
 // ============================================================================
 enum class ItemStatus : qint16 { 
-    Available = 0, 
-    Assigned = 1, 
-    Exported = 2 
+    Available = 0,
+	Printed = 5,
+    Read = 10,
+    Assigned = 20,
+    Exported = 30
 };
 
 enum class BoxStatus : qint16 { 
-    Empty = 0, 
-    Sealed = 1, 
-    Exported = 2 
+    Empty = 0,
+	Printed = 5,
+	Read = 10,
+    Sealed = 20,
+    Exported = 30
 };
 
 enum class PalletStatus : qint16 { 
-    New = 0, 
-    Complete = 1, 
-    Exported = 2 
+    New = 0,
+	Printed = 5,
+	Read = 10,
+    Complete = 20,
+    Exported = 30
 };
 
 enum class ExportMode : qint16 { 
@@ -56,6 +62,8 @@ enum class ExportMode : qint16 {
 inline QString itemStatusToString(ItemStatus status) {
     switch (status) {
         case ItemStatus::Available: return "Available";
+        case ItemStatus::Printed: return "Printed";
+		case ItemStatus::Read: return "Read";
         case ItemStatus::Assigned: return "Assigned";
         case ItemStatus::Exported: return "Exported";
         default: return "Unknown";
@@ -65,6 +73,8 @@ inline QString itemStatusToString(ItemStatus status) {
 inline QString boxStatusToString(BoxStatus status) {
     switch (status) {
         case BoxStatus::Empty: return "Empty";
+        case BoxStatus::Printed: return "printed";
+		case BoxStatus::Read: return "Read";
         case BoxStatus::Sealed: return "Sealed";
         case BoxStatus::Exported: return "Exported";
         default: return "Unknown";
@@ -74,6 +84,8 @@ inline QString boxStatusToString(BoxStatus status) {
 inline QString palletStatusToString(PalletStatus status) {
     switch (status) {
         case PalletStatus::New: return "New";
+        case PalletStatus::Printed: return "printed";
+		case PalletStatus::Read: return "Read";
         case PalletStatus::Complete: return "Complete";
         case PalletStatus::Exported: return "Exported";
         default: return "Unknown";

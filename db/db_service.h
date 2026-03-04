@@ -122,9 +122,8 @@ public:
     // =========================================================================
     
     std::optional<Item> getItem(ItemId id);
-    QVector<Item> getItemsByStatus(ItemStatus status, 
-                                    ProductionLineId lineId, 
-                                    int limit);
+    QVector<Item> getItemsByStatus(ItemStatus status, ProductionLineId lineId, int limit);
+    QVector<Item> getItems(ItemId startId, const std::string& gtin, ItemStatus status, ProductionLineId lineId, int limit);
     QVector<Item> getItemsInBox(BoxId boxId);
     int countScannedItemsNotInBox(ProductionLineId lineId);
     bool assignItemToBox(ItemId itemId, BoxId boxId);
@@ -136,9 +135,9 @@ public:
     // =========================================================================
     
     std::optional<core::Box> getBox(BoxId id);
-    QVector<Box> getBoxesByStatus(BoxStatus status, 
-                                   ProductionLineId lineId,
-                                   int limit);
+    QVector<Box> getBoxesByStatus(BoxStatus status, ProductionLineId lineId, int limit);
+    QVector<Box> getBoxes(BoxId startId, const std::string&, BoxStatus status, ProductionLineId lineId, int limit);
+
     QVector<Box> getSealedBoxesNotOnPallet(ProductionLineId lineId, int limit);
     int countSealedBoxesNotOnPallet(ProductionLineId lineId);
     QVector<Box> getBoxesOnPallet(PalletId palletId);
@@ -146,14 +145,19 @@ public:
     bool assignBoxToPallet(BoxId boxId, PalletId palletId);
     int getBoxItemCount(BoxId id);
 
+    // Add in class DbService public section (near createThreadLocalConnection)
+    static bool updateItemStatus(QSqlDatabase& db, ItemId itemId, ItemStatus status);
+    static bool assignItemsToBox(QSqlDatabase& db, const QVector<ItemId>& itemIds, BoxId boxId);
+	static bool addBoxToPallet(QSqlDatabase& db, BoxId boxId, PalletId palletId);
+
     // =========================================================================
     // Pallet Operations (SYNC)
     // =========================================================================
     
     std::optional<Pallet> getPallet(PalletId id);
-    QVector<Pallet> getPalletsByStatus(PalletStatus status, 
-                                        ProductionLineId lineId = 0,
-                                        int limit = 100);
+    QVector<Pallet> getPalletsByStatus(PalletStatus status, ProductionLineId lineId = 0, int limit = 100);
+    QVector<Pallet> getPallets(PalletId startId, const std::string& gtin, PalletStatus status, ProductionLineId lineId, int limit);
+
     bool completePallet(PalletId id);
 
     QVector<Pallet> getPallets();
