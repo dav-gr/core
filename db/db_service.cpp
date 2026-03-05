@@ -542,11 +542,12 @@ if (!db.isOpen()) {
         QString barcodeList = quotedBarcodes.join(",");
 
         // Restore soft-deleted records and get their IDs
+        // status=0 is the initial state for all entity types (Available/Empty/New)
         QString restoreSql = QString(
-            "UPDATE %1 SET is_deleted = false, deleted_at = NULL, status = 0, %2 = NOW() "
+            "UPDATE %1 SET is_deleted = false, deleted_at = NULL, status = %4, %2 = NOW() "
             "WHERE bar_code IN (%3) AND is_deleted = true "
             "RETURNING id"
-        ).arg(tableName, timestampCol, barcodeList);
+        ).arg(tableName, timestampCol, barcodeList).arg(static_cast<int>(ItemStatus::Available));
 
         QSqlQuery restoreQuery(db);
         int restoredCount = 0;
@@ -560,7 +561,8 @@ if (!db.isOpen()) {
         // Step 2: Insert truly new records (not existing at all)
         QStringList valuePlaceholders;
         for (int j = 0; j < batch.size(); ++j) {
-            valuePlaceholders.append(QString("(:bc%1, :lineId, 0, NOW(), false)").arg(j));
+            // status=0 is the initial state for all entity types (Available/Empty/New)
+            valuePlaceholders.append(QString("(:bc%1, :lineId, %2, NOW(), false)").arg(j).arg(static_cast<int>(ItemStatus::Available)));
         }
 
         QString insertSql = QString(
@@ -864,11 +866,12 @@ bool DbService::doDeleteImportDocument(ImportDocumentId docId, const QString& ta
 
     // Step 2: Check if any entities have been exported using junction table join
     QSqlQuery checkQuery(db);
+    // Exported status (30) is the same value for all entity types
     QString checkSql = QString(
         "SELECT COUNT(*) FROM %1 t "
         "INNER JOIN %2 j ON t.id = j.%3 "
-        "WHERE j.import_doc_id = %4 AND t.status = 2 AND t.is_deleted = false"
-    ).arg(tableName, junctionTableName, entityIdCol).arg(docId);
+        "WHERE j.import_doc_id = %4 AND t.status = %5 AND t.is_deleted = false"
+    ).arg(tableName, junctionTableName, entityIdCol).arg(docId).arg(static_cast<int>(ItemStatus::Exported));
 
     if (!checkQuery.exec(checkSql) || !checkQuery.next()) {
         db.rollback();
@@ -1195,11 +1198,12 @@ QVector<Item> DbService::getScannedItemsNotInBox(ProductionLineId lineId, int li
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
 
-    QString sql = 
+    QString sql = QString(
         "SELECT i.id, i.bar_code, i.status, i.production_line, i.imported_at, i.scanned_at "
         "FROM items i "
         "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
-        "WHERE i.status = 1 AND iba.item_id IS NULL AND i.is_deleted = false";
+        "WHERE i.status = %1 AND iba.item_id IS NULL AND i.is_deleted = false")
+        .arg(static_cast<int>(ItemStatus::Read));
 
     if (lineId > 0) {
         sql += QString(" AND i.production_line = %1").arg(lineId);
@@ -1224,11 +1228,12 @@ int DbService::countScannedItemsNotInBox(ProductionLineId lineId) {
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
     
-    QString sql = 
+    QString sql = QString(
         "SELECT COUNT(*) FROM items i "
         "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
-        "WHERE i.status = 1 AND iba.item_id IS NULL AND i.is_deleted = false";
-    
+        "WHERE i.status = %1 AND iba.item_id IS NULL AND i.is_deleted = false")
+        .arg(static_cast<int>(ItemStatus::Read));
+
     if (lineId > 0) {
         sql += " AND i.production_line = :lineId";
     }
@@ -1251,7 +1256,7 @@ bool DbService::assignItemToBox(ItemId itemId, BoxId boxId) {
     QSqlDatabase db = getDatabase();
     db.transaction();
     
-    // Verify box exists and is empty (status = 0)
+    // Verify box exists and is empty (status = Empty)
     QSqlQuery boxQuery(db);
     boxQuery.prepare("SELECT id, status FROM boxes WHERE id = :id AND is_deleted = false");
     boxQuery.bindValue(":id", boxId);
@@ -1263,26 +1268,26 @@ bool DbService::assignItemToBox(ItemId itemId, BoxId boxId) {
         return false;
     }
     
-    if (boxQuery.value(1).toInt() != 0) {
+    if (boxQuery.value(1).toInt() != static_cast<int>(BoxStatus::Empty)) {
         db.rollback();
         QMutexLocker locker(&mutex_);
         lastError_ = "Box must be Empty";
         return false;
     }
-    
-    // Verify item exists and is available (status = 0)
+
+    // Verify item exists and is available (status = Available)
     QSqlQuery itemQuery(db);
     itemQuery.prepare("SELECT id, status FROM items WHERE id = :id AND is_deleted = false");
     itemQuery.bindValue(":id", itemId);
-    
+
     if (!itemQuery.exec() || !itemQuery.next()) {
         db.rollback();
         QMutexLocker locker(&mutex_);
         lastError_ = "Item not found";
         return false;
     }
-    
-    if (itemQuery.value(1).toInt() != 0) {
+
+    if (itemQuery.value(1).toInt() != static_cast<int>(ItemStatus::Available)) {
         db.rollback();
         QMutexLocker locker(&mutex_);
         lastError_ = "Item must be Available";
@@ -1307,7 +1312,7 @@ bool DbService::assignItemToBox(ItemId itemId, BoxId boxId) {
     
     // Update item status
     QSqlQuery updateQuery(db);
-    updateQuery.prepare("UPDATE items SET status = 1 WHERE id = :id");
+    updateQuery.prepare(QString("UPDATE items SET status = %1 WHERE id = :id").arg(static_cast<int>(ItemStatus::Assigned)));
     updateQuery.bindValue(":id", itemId);
     
     if (!updateQuery.exec()) {
@@ -1391,11 +1396,12 @@ QVector<Box> DbService::getSealedBoxesNotOnPallet(ProductionLineId lineId, int l
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
 
-    QString sql = 
+    QString sql = QString(
         "SELECT b.id, b.bar_code, b.status, b.production_line, b.imported_at, b.sealed_at "
         "FROM boxes b "
         "LEFT JOIN pallet_box_assignments pba ON b.id = pba.box_id "
-        "WHERE b.status = 1 AND pba.box_id IS NULL AND b.is_deleted = false";
+        "WHERE b.status = %1 AND pba.box_id IS NULL AND b.is_deleted = false")
+        .arg(static_cast<int>(BoxStatus::Sealed));
 
     if (lineId > 0) {
         sql += QString(" AND b.production_line = %1").arg(lineId);
@@ -1420,11 +1426,12 @@ int DbService::countSealedBoxesNotOnPallet(ProductionLineId lineId) {
     QSqlDatabase db = getDatabase();
     QSqlQuery query(db);
     
-    QString sql = 
+    QString sql = QString(
         "SELECT COUNT(*) FROM boxes b "
         "LEFT JOIN pallet_box_assignments pba ON b.id = pba.box_id "
-        "WHERE b.status = 1 AND pba.box_id IS NULL AND b.is_deleted = false";
-    
+        "WHERE b.status = %1 AND pba.box_id IS NULL AND b.is_deleted = false")
+        .arg(static_cast<int>(BoxStatus::Sealed));
+
     if (lineId > 0) {
         sql += " AND b.production_line = :lineId";
     }
@@ -1487,10 +1494,10 @@ bool DbService::sealBox(BoxId id) {
     }
     
     QSqlQuery query(db);
-    query.prepare(
-        "UPDATE boxes SET status = 1, sealed_at = NOW() "
-        "WHERE id = :id AND status = 0"
-    );
+    query.prepare(QString(
+        "UPDATE boxes SET status = %1, sealed_at = NOW() "
+        "WHERE id = :id AND status < %1"
+    ).arg(static_cast<int>(BoxStatus::Sealed)));
     query.bindValue(":id", id);
     
     if (query.exec() && query.numRowsAffected() > 0) {
@@ -1508,7 +1515,7 @@ bool DbService::assignBoxToPallet(BoxId boxId, PalletId palletId) {
     QSqlDatabase db = getDatabase();
     db.transaction();
     
-    // Verify pallet exists and is new (status = 0)
+    // Verify pallet exists and is new (status = New)
     QSqlQuery palletQuery(db);
     palletQuery.prepare("SELECT id, status FROM pallets WHERE id = :id AND is_deleted = false");
     palletQuery.bindValue(":id", palletId);
@@ -1520,14 +1527,14 @@ bool DbService::assignBoxToPallet(BoxId boxId, PalletId palletId) {
         return false;
     }
     
-    if (palletQuery.value(1).toInt() != 0) {
+    if (palletQuery.value(1).toInt() != static_cast<int>(PalletStatus::New)) {
         db.rollback();
         QMutexLocker locker(&mutex_);
         lastError_ = "Pallet must be New";
         return false;
     }
-    
-    // Verify box exists and is sealed (status = 1)
+
+    // Verify box exists and is sealed (status = Sealed)
     QSqlQuery boxQuery(db);
     boxQuery.prepare("SELECT id, status FROM boxes WHERE id = :id AND is_deleted = false");
     boxQuery.bindValue(":id", boxId);
@@ -1539,7 +1546,7 @@ bool DbService::assignBoxToPallet(BoxId boxId, PalletId palletId) {
         return false;
     }
 
-    if (boxQuery.value(1).toInt() != 1) {
+    if (boxQuery.value(1).toInt() != static_cast<int>(BoxStatus::Sealed)) {
         db.rollback();
         QMutexLocker locker(&mutex_);
         lastError_ = "Box must be Sealed";
@@ -1867,13 +1874,13 @@ ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QStr
     }
     QString idList = idStrings.join(",");
     
-    // Verify items have status = 1 (Assigned/Scanned) and are not in any box
+    // Verify items have status = Read (scanned) and are not in any box
     QSqlQuery verifyQuery(db);
     QString verifySql = QString(
         "SELECT COUNT(*) FROM items i "
         "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
-        "WHERE i.id IN (%1) AND i.status = 1 AND iba.item_id IS NULL AND i.is_deleted = false"
-    ).arg(idList);
+        "WHERE i.id IN (%1) AND i.status = %2 AND iba.item_id IS NULL AND i.is_deleted = false"
+    ).arg(idList).arg(static_cast<int>(ItemStatus::Read));
     
     if (!verifyQuery.exec(verifySql) || !verifyQuery.next()) {
         db.rollback();
@@ -1887,12 +1894,11 @@ ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QStr
         return result;
     }
     
-    // Create document with export_mode = 2 (ItemExport)
     QSqlQuery createDoc(db);
-    createDoc.prepare(
+    createDoc.prepare(QString(
         "INSERT INTO export_documents (export_mode, lp_tin, created_at) "
-        "VALUES (2, :lpTin, NOW()) RETURNING id"
-    );
+        "VALUES (%1, :lpTin, NOW()) RETURNING id"
+    ).arg(static_cast<int>(ExportMode::ItemExport)));
     createDoc.bindValue(":lpTin", lpTin);
     
     if (!createDoc.exec() || !createDoc.next()) {
@@ -1919,19 +1925,19 @@ ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QStr
     
     // Update item statuses to Exported
     QString updateSql = QString(
-        "UPDATE items SET status = 2 WHERE id IN (%1)"
-    ).arg(idList);
-    
+        "UPDATE items SET status = %2 WHERE id IN (%1)"
+    ).arg(idList).arg(static_cast<int>(ItemStatus::Exported));
+
     QSqlQuery updateQuery(db);
     if (!updateQuery.exec(updateSql)) {
         db.rollback();
         result.error = "Failed to update item statuses";
         return result;
     }
-    
+
     db.commit();
     result.success = true;
-    
+
     qDebug() << "DbService: Item export complete - Doc:" << result.documentId;
     
     // Generate XML content
@@ -1992,8 +1998,8 @@ QString idList = idStrings.join(",");
 // Verify boxes are sealed
 QSqlQuery verifyQuery(db);
 QString verifySql = QString(
-    "SELECT COUNT(*) FROM boxes WHERE id IN (%1) AND status = 1 AND is_deleted = false"
-).arg(idList);
+    "SELECT COUNT(*) FROM boxes WHERE id IN (%1) AND status = %2 AND is_deleted = false"
+).arg(idList).arg(static_cast<int>(BoxStatus::Sealed));
     
 if (!verifyQuery.exec(verifySql) || !verifyQuery.next()) {
     db.rollback();
@@ -2009,10 +2015,10 @@ if (verifyQuery.value(0).toInt() != boxIds.size()) {
     
 // Create document
 QSqlQuery createDoc(db);
-createDoc.prepare(
+createDoc.prepare(QString(
     "INSERT INTO export_documents (export_mode, lp_tin, created_at) "
-    "VALUES (0, :lpTin, NOW()) RETURNING id"
-);
+    "VALUES (%1, :lpTin, NOW()) RETURNING id"
+).arg(static_cast<int>(ExportMode::BoxExport)));
 createDoc.bindValue(":lpTin", lpTin);
     
 if (!createDoc.exec() || !createDoc.next()) {
@@ -2056,21 +2062,21 @@ result.itemsExported = itemSnapshotQuery.numRowsAffected();
     
 // Update box statuses to Exported
 QString updateSql = QString(
-    "UPDATE boxes SET status = 2 WHERE id IN (%1)"
-).arg(idList);
-    
+    "UPDATE boxes SET status = %2 WHERE id IN (%1)"
+).arg(idList).arg(static_cast<int>(BoxStatus::Exported));
+
 QSqlQuery updateQuery(db);
 if (!updateQuery.exec(updateSql)) {
     db.rollback();
     result.error = "Failed to update box statuses";
     return result;
 }
-    
+
 // Update item statuses to Exported
 QString updateItemsSql = QString(
-    "UPDATE items SET status = 2 WHERE id IN ("
+    "UPDATE items SET status = %2 WHERE id IN ("
     "  SELECT item_id FROM item_box_assignments WHERE box_id IN (%1))"
-).arg(idList);
+).arg(idList).arg(static_cast<int>(ItemStatus::Exported));
     
 QSqlQuery updateItemsQuery(db);
 if (!updateItemsQuery.exec(updateItemsSql)) {
@@ -2143,8 +2149,8 @@ ExportResult DbService::doExportPallets(const QVector<PalletId>& palletIds, cons
     // Verify pallets are complete
     QSqlQuery verifyQuery(db);
     QString verifySql = QString(
-        "SELECT COUNT(*) FROM pallets WHERE id IN (%1) AND status = 1 AND is_deleted = false"
-    ).arg(idList);
+        "SELECT COUNT(*) FROM pallets WHERE id IN (%1) AND status = %2 AND is_deleted = false"
+    ).arg(idList).arg(static_cast<int>(PalletStatus::Complete));
     
     if (!verifyQuery.exec(verifySql) || !verifyQuery.next()) {
         db.rollback();
@@ -2160,10 +2166,10 @@ ExportResult DbService::doExportPallets(const QVector<PalletId>& palletIds, cons
     
     // Create document
     QSqlQuery createDoc(db);
-    createDoc.prepare(
+    createDoc.prepare(QString(
         "INSERT INTO export_documents (export_mode, lp_tin, created_at) "
-        "VALUES (1, :lpTin, NOW()) RETURNING id"
-    );
+        "VALUES (%1, :lpTin, NOW()) RETURNING id"
+    ).arg(static_cast<int>(ExportMode::PalletExport)));
     createDoc.bindValue(":lpTin", lpTin);
     
     if (!createDoc.exec() || !createDoc.next()) {
@@ -2226,38 +2232,38 @@ ExportResult DbService::doExportPallets(const QVector<PalletId>& palletIds, cons
     
     // Update pallet statuses to Exported
     QString updatePalletSql = QString(
-        "UPDATE pallets SET status = 2 WHERE id IN (%1)"
-    ).arg(idList);
-    
+        "UPDATE pallets SET status = %2 WHERE id IN (%1)"
+    ).arg(idList).arg(static_cast<int>(PalletStatus::Exported));
+
     QSqlQuery updatePalletQuery(db);
     if (!updatePalletQuery.exec(updatePalletSql)) {
         db.rollback();
         result.error = "Failed to update pallet statuses";
         return result;
     }
-    
+
     // Update box statuses to Exported
     QString updateBoxesSql = QString(
-        "UPDATE boxes SET status = 2 WHERE id IN ("
+        "UPDATE boxes SET status = %2 WHERE id IN ("
         "  SELECT box_id FROM pallet_box_assignments WHERE pallet_id IN (%1))"
-    ).arg(idList);
-    
+    ).arg(idList).arg(static_cast<int>(BoxStatus::Exported));
+
     QSqlQuery updateBoxesQuery(db);
     if (!updateBoxesQuery.exec(updateBoxesSql)) {
         db.rollback();
         result.error = "Failed to update box statuses";
         return result;
     }
-    
+
     // Update item statuses to Exported
     QString updateItemsSql = QString(
-        "UPDATE items SET status = 2 WHERE id IN ("
+        "UPDATE items SET status = %2 WHERE id IN ("
         "  SELECT i.id FROM items i "
         "  JOIN item_box_assignments iba ON i.id = iba.item_id "
         "  JOIN boxes b ON iba.box_id = b.id "
         "  JOIN pallet_box_assignments pba ON b.id = pba.box_id "
         "  WHERE pba.pallet_id IN (%1))"
-    ).arg(idList);
+    ).arg(idList).arg(static_cast<int>(ItemStatus::Exported));
     
     QSqlQuery updateItemsQuery(db);
     if (!updateItemsQuery.exec(updateItemsSql)) {
@@ -2397,43 +2403,43 @@ ProductionStats DbService::getStats(std::optional<ProductionLineId> lineId) {
     QSqlQuery itemsQuery(db);
     if (itemsQuery.exec(QString("SELECT status, COUNT(*) FROM items%1 GROUP BY status").arg(where))) {
         while (itemsQuery.next()) {
-            int status = itemsQuery.value(0).toInt();
             int count = itemsQuery.value(1).toInt();
             stats.totalItems += count;
-            switch (status) {
-                case 0: stats.availableItems = count; break;
-                case 1: stats.assignedItems = count; break;
-                case 2: stats.exportedItems = count; break;
+            switch (static_cast<ItemStatus>(itemsQuery.value(0).toInt())) {
+                case ItemStatus::Available: stats.availableItems = count; break;
+                case ItemStatus::Assigned:  stats.assignedItems  = count; break;
+                case ItemStatus::Exported:  stats.exportedItems  = count; break;
+                default: break;
             }
         }
     }
-    
+
     // Boxes
     QSqlQuery boxesQuery(db);
     if (boxesQuery.exec(QString("SELECT status, COUNT(*) FROM boxes%1 GROUP BY status").arg(where))) {
         while (boxesQuery.next()) {
-            int status = boxesQuery.value(0).toInt();
             int count = boxesQuery.value(1).toInt();
             stats.totalBoxes += count;
-            switch (status) {
-                case 0: stats.emptyBoxes = count; break;
-                case 1: stats.sealedBoxes = count; break;
-                case 2: stats.exportedBoxes = count; break;
+            switch (static_cast<BoxStatus>(boxesQuery.value(0).toInt())) {
+                case BoxStatus::Empty:    stats.emptyBoxes   = count; break;
+                case BoxStatus::Sealed:   stats.sealedBoxes  = count; break;
+                case BoxStatus::Exported: stats.exportedBoxes = count; break;
+                default: break;
             }
         }
     }
-    
+
     // Pallets
     QSqlQuery palletsQuery(db);
     if (palletsQuery.exec(QString("SELECT status, COUNT(*) FROM pallets%1 GROUP BY status").arg(where))) {
         while (palletsQuery.next()) {
-            int status = palletsQuery.value(0).toInt();
             int count = palletsQuery.value(1).toInt();
             stats.totalPallets += count;
-            switch (status) {
-                case 0: stats.newPallets = count; break;
-                case 1: stats.completePallets = count; break;
-                case 2: stats.exportedPallets = count; break;
+            switch (static_cast<PalletStatus>(palletsQuery.value(0).toInt())) {
+                case PalletStatus::New:      stats.newPallets      = count; break;
+                case PalletStatus::Complete: stats.completePallets = count; break;
+                case PalletStatus::Exported: stats.exportedPallets = count; break;
+                default: break;
             }
         }
     }
@@ -3456,10 +3462,10 @@ ActionResult DbService::unsealBoxAction(BoxId boxId) {
         itemIds.append(itemsQuery.value(0).toLongLong());
     }
 
-    // 2. Reset all assigned items to status 0
+    // 2. Reset all assigned items to Available
     for (ItemId iid : itemIds) {
         QSqlQuery updateItem(db);
-        updateItem.prepare("UPDATE items SET status = 0, scanned_at = NULL WHERE id = :id");
+        updateItem.prepare(QString("UPDATE items SET status = %1, scanned_at = NULL WHERE id = :id").arg(static_cast<int>(ItemStatus::Available)));
         updateItem.bindValue(":id", iid);
         if (!updateItem.exec()) {
             db.rollback();
@@ -3478,9 +3484,9 @@ ActionResult DbService::unsealBoxAction(BoxId boxId) {
         return result;
     }
 
-    // 4. Reset box status to 0 (Empty)
+    // 4. Reset box status to Empty
     QSqlQuery updateBox(db);
-    updateBox.prepare("UPDATE boxes SET status = 0, sealed_at = NULL WHERE id = :id");
+    updateBox.prepare(QString("UPDATE boxes SET status = %1, sealed_at = NULL WHERE id = :id").arg(static_cast<int>(BoxStatus::Empty)));
     updateBox.bindValue(":id", boxId);
     if (!updateBox.exec()) {
         db.rollback();
@@ -3511,9 +3517,9 @@ ActionResult DbService::destroyItemAction(ItemId itemId) {
     delAssign.exec();  // OK if no rows affected (item might not be in a box)
 
 
-    // 2. Reset item status to 0
+    // 2. Reset item status to Available
     QSqlQuery updateItem(db);
-    updateItem.prepare("UPDATE items SET status = 0, scanned_at = NULL WHERE id = :id");
+    updateItem.prepare(QString("UPDATE items SET status = %1, scanned_at = NULL WHERE id = :id").arg(static_cast<int>(ItemStatus::Available)));
     updateItem.bindValue(":id", itemId);
     if (!updateItem.exec()) {
         db.rollback();
@@ -3546,10 +3552,10 @@ bool DbService::completePallet(PalletId id) {
     }
 
     QSqlQuery query(db);
-    query.prepare(
-        "UPDATE pallets SET status = 1 "
-        "WHERE id = :id AND status = 0"
-    );
+    query.prepare(QString(
+        "UPDATE pallets SET status = %1 "
+        "WHERE id = :id AND status < %1"
+    ).arg(static_cast<int>(PalletStatus::Complete)));
     query.bindValue(":id", id);
 
     return query.exec() && query.numRowsAffected() > 0;
