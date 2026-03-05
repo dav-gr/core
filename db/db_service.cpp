@@ -1381,7 +1381,7 @@ int DbService::countSealedBoxesNotOnPallet(ProductionLineId lineId) {
     }
     
     query.prepare(sql);
-    query.bindValue(":st", static_cast<int>(BaseStatus::Assigned));
+    query.bindValue(":st", static_cast<int>(BoxStatus::Sealed));
     if (lineId > 0) {
         query.bindValue(":lineId", lineId);
     }
@@ -1444,8 +1444,8 @@ bool DbService::sealBox(BoxId id) {
         "WHERE id = :id AND status < %1"
     ).arg(static_cast<int>(BoxStatus::Sealed)));
     query.bindValue(":id", id);
-    query.bindValue(":nst", static_cast<int>(BaseStatus::Assigned));
-    query.bindValue(":st", static_cast<int>(BaseStatus::New));
+    query.bindValue(":nst", static_cast<int>(BoxStatus::Sealed));
+    query.bindValue(":st", static_cast<int>(BoxStatus::Empty));
 
     
     if (query.exec() && query.numRowsAffected() > 0) {
@@ -3493,7 +3493,7 @@ bool DbService::completePallet(PalletId id) {
         "WHERE id = :id AND status < %1"
     ).arg(static_cast<int>(PalletStatus::Complete)));
     query.bindValue(":id", id);
-	query.bindValue(":st", static_cast<int>(PalletStatus::Completed));
+	query.bindValue(":st", static_cast<int>(PalletStatus::Complete));
 
     return query.exec() && query.numRowsAffected() > 0;
 }
