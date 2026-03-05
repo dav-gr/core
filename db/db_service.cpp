@@ -370,46 +370,6 @@ QSqlDatabase DbService::createThreadLocalConnection(const QString& host, int por
     return db;
 }
 
-// Helper: Ensure soft delete columns exist on entity table
-// TODO: Add background cleanup job to periodically DELETE FROM table WHERE is_deleted = true AND deleted_at < NOW() - INTERVAL '7 days'
-bool DbService::ensureSoftDeleteColumns(QSqlDatabase& db, const QString& tableName) {
-    QSqlQuery query(db);
-
-    // Add is_deleted column if not exists
-    QString addIsDeletedSql = QString(
-        "ALTER TABLE %1 ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT false"
-    ).arg(tableName);
-
-    if (!query.exec(addIsDeletedSql)) {
-        qWarning() << "Failed to add is_deleted column to" << tableName << ":" << query.lastError().text();
-        return false;
-    }
-
-    // Add deleted_at column if not exists
-    QString addDeletedAtSql = QString(
-        "ALTER TABLE %1 ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL"
-    ).arg(tableName);
-
-    if (!query.exec(addDeletedAtSql)) {
-        qWarning() << "Failed to add deleted_at column to" << tableName << ":" << query.lastError().text();
-        return false;
-    }
-
-    // Create partial index for fast queries on active records (if not exists)
-    // This ensures queries with "WHERE is_deleted = false" use index efficiently
-    QString timestampCol = (tableName == "pallets") ? "created_at" : "imported_at";
-    QString createIndexSql = QString(
-        "CREATE INDEX IF NOT EXISTS idx_%1_active_status ON %1 (status, %2) WHERE is_deleted = false"
-    ).arg(tableName, timestampCol);
-
-    if (!query.exec(createIndexSql)) {
-        qWarning() << "Failed to create partial index on" << tableName << ":" << query.lastError().text();
-        // Non-fatal - continue without index
-    }
-
-    return true;
-}
-
 ImportResult DbService::doImport(const QString& filePath, ProductionLineId lineId,
                                const QString& tableName, const QString& importTableName,
                                UserId userId) {
@@ -467,12 +427,6 @@ if (!db.isOpen()) {
  }
 
     QString timestampCol = (tableName == "pallets") ? "created_at" : "imported_at";
-
-    // Ensure soft delete columns exist on main entity table
-    if (!ensureSoftDeleteColumns(db, tableName)) {
-        result.errors.append("Failed to setup soft delete columns on " + tableName);
-        return result;
-    }
 
     // Create import documents table if it doesn't exist
     QString createTableSql = QString(
@@ -818,16 +772,6 @@ bool DbService::doDeleteImportDocument(ImportDocumentId docId, const QString& ta
 
     db.transaction();
     emit deleteProgress(0, 100);
-
-    // Ensure soft delete columns exist
-    if (!ensureSoftDeleteColumns(db, tableName)) {
-        db.rollback();
-        QMutexLocker locker(&mutex_);
-        lastError_ = "Failed to setup soft delete columns";
-        return false;
-    }
-
-    emit deleteProgress(5, 100); // 5% - schema ready
 
     // Step 1: Get count of entities to soft-delete (fast COUNT query)
     QSqlQuery countQuery(db);
@@ -1437,6 +1381,7 @@ int DbService::countSealedBoxesNotOnPallet(ProductionLineId lineId) {
     }
     
     query.prepare(sql);
+    query.bindValue(":st", static_cast<int>(BaseStatus::Assigned));
     if (lineId > 0) {
         query.bindValue(":lineId", lineId);
     }
@@ -1499,6 +1444,9 @@ bool DbService::sealBox(BoxId id) {
         "WHERE id = :id AND status < %1"
     ).arg(static_cast<int>(BoxStatus::Sealed)));
     query.bindValue(":id", id);
+    query.bindValue(":nst", static_cast<int>(BaseStatus::Assigned));
+    query.bindValue(":st", static_cast<int>(BaseStatus::New));
+
     
     if (query.exec() && query.numRowsAffected() > 0) {
         return true;
@@ -1517,8 +1465,9 @@ bool DbService::assignBoxToPallet(BoxId boxId, PalletId palletId) {
     
     // Verify pallet exists and is new (status = New)
     QSqlQuery palletQuery(db);
-    palletQuery.prepare("SELECT id, status FROM pallets WHERE id = :id AND is_deleted = false");
+    palletQuery.prepare("SELECT id FROM pallets WHERE id = :id AND status < :st AND is_deleted = false LIMIT 1");
     palletQuery.bindValue(":id", palletId);
+    palletQuery.bindValue(":st", static_cast<int>(PalletStatus::Complete));
     
     if (!palletQuery.exec() || !palletQuery.next()) {
         db.rollback();
@@ -1526,18 +1475,12 @@ bool DbService::assignBoxToPallet(BoxId boxId, PalletId palletId) {
         lastError_ = "Pallet not found";
         return false;
     }
-    
-    if (palletQuery.value(1).toInt() != static_cast<int>(PalletStatus::New)) {
-        db.rollback();
-        QMutexLocker locker(&mutex_);
-        lastError_ = "Pallet must be New";
-        return false;
-    }
-
-    // Verify box exists and is sealed (status = Sealed)
+   
+    // Verify box exists and is sealed (status = 1)
     QSqlQuery boxQuery(db);
-    boxQuery.prepare("SELECT id, status FROM boxes WHERE id = :id AND is_deleted = false");
+    boxQuery.prepare("SELECT id FROM boxes WHERE id = :id AND status = :st AND is_deleted = false LIMIT 1");
     boxQuery.bindValue(":id", boxId);
+    boxQuery.bindValue(":st", static_cast<int>(BoxStatus::Sealed));
 
     if (!boxQuery.exec() || !boxQuery.next()) {
         db.rollback();
@@ -1580,8 +1523,7 @@ int DbService::getBoxItemCount(BoxId id) {
     QSqlQuery query(db);
     
     query.prepare(
-        "SELECT COUNT(*) FROM item_box_assignments iba "
-        "JOIN boxes b ON iba.box_id = b.id WHERE b.id = :id"
+        "SELECT COUNT(*) FROM item_box_assignments iba JOIN boxes b ON iba.box_id = b.id WHERE b.id = :id"
     );
     query.bindValue(":id", id);
     
@@ -1627,8 +1569,7 @@ QVector<Pallet> DbService::getPallets() {
     return pallets;
 }
 
-QVector<Pallet> DbService::getPalletsByStatus(PalletStatus status, ProductionLineId lineId,
-                                               int limit) {
+QVector<Pallet> DbService::getPalletsByStatus(PalletStatus status, ProductionLineId lineId, int limit) {
     QVector<Pallet> pallets;
 
     if (!ensureConnected()) return pallets;
@@ -1650,12 +1591,7 @@ QVector<Pallet> DbService::getPalletsByStatus(PalletStatus status, ProductionLin
     if (query.exec(sql)) {
         while (query.next()) {
             // Parse legacy schema (without package_id and package_count)
-            Pallet pallet;
-            pallet.id = query.value(0).toLongLong();
-            pallet.barcode = query.value(1).toString();
-            pallet.status = static_cast<PalletStatus>(query.value(2).toInt());
-            pallet.productionLine = query.value(3).toLongLong();
-            pallet.createdAt = query.value(4).toDateTime();
+            Pallet pallet = parsePallet(query);
             pallets.append(pallet);
         }
     } else {
@@ -1797,7 +1733,7 @@ bool DbService::updatePallet(const Pallet& pallet) {
     }
     return query.numRowsAffected() > 0;
 }
-
+//TODO set deleted
 bool DbService::deletePallet(PalletId id) {
     if (!ensureConnected()) return false;
     QSqlDatabase db = getDatabase();
@@ -1880,7 +1816,7 @@ ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QStr
         "SELECT COUNT(*) FROM items i "
         "LEFT JOIN item_box_assignments iba ON i.id = iba.item_id "
         "WHERE i.id IN (%1) AND i.status = %2 AND iba.item_id IS NULL AND i.is_deleted = false"
-    ).arg(idList).arg(static_cast<int>(ItemStatus::Read));
+    ).arg(idList).arg(static_cast<int>(ItemStatus::Assigned));
     
     if (!verifyQuery.exec(verifySql) || !verifyQuery.next()) {
         db.rollback();
@@ -2244,10 +2180,10 @@ ExportResult DbService::doExportPallets(const QVector<PalletId>& palletIds, cons
 
     // Update box statuses to Exported
     QString updateBoxesSql = QString(
-        "UPDATE boxes SET status = %2 WHERE id IN ("
-        "  SELECT box_id FROM pallet_box_assignments WHERE pallet_id IN (%1))"
-    ).arg(idList).arg(static_cast<int>(BoxStatus::Exported));
-
+        "UPDATE boxes SET status = %1 WHERE id IN ("
+        "  SELECT box_id FROM pallet_box_assignments WHERE pallet_id IN (%2))"
+    ).arg(static_cast<int>(BoxStatus::Exported)).arg(idList);
+    
     QSqlQuery updateBoxesQuery(db);
     if (!updateBoxesQuery.exec(updateBoxesSql)) {
         db.rollback();
@@ -2257,13 +2193,13 @@ ExportResult DbService::doExportPallets(const QVector<PalletId>& palletIds, cons
 
     // Update item statuses to Exported
     QString updateItemsSql = QString(
-        "UPDATE items SET status = %2 WHERE id IN ("
+        "UPDATE items SET status = %1 WHERE id IN ("
         "  SELECT i.id FROM items i "
         "  JOIN item_box_assignments iba ON i.id = iba.item_id "
         "  JOIN boxes b ON iba.box_id = b.id "
         "  JOIN pallet_box_assignments pba ON b.id = pba.box_id "
-        "  WHERE pba.pallet_id IN (%1))"
-    ).arg(idList).arg(static_cast<int>(ItemStatus::Exported));
+        "  WHERE pba.pallet_id IN (%2))"
+    ).arg(static_cast<int>(ItemStatus::Exported)).arg(idList);
     
     QSqlQuery updateItemsQuery(db);
     if (!updateItemsQuery.exec(updateItemsSql)) {
@@ -3557,6 +3493,7 @@ bool DbService::completePallet(PalletId id) {
         "WHERE id = :id AND status < %1"
     ).arg(static_cast<int>(PalletStatus::Complete)));
     query.bindValue(":id", id);
+	query.bindValue(":st", static_cast<int>(PalletStatus::Completed));
 
     return query.exec() && query.numRowsAffected() > 0;
 }
