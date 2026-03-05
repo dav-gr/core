@@ -266,10 +266,7 @@ private:
     bool doDeleteImportDocument(ImportDocumentId docId, const QString& tableName,
                                 const QString& importTableName, const QString& junctionTableName,
                                 const QString& entityIdCol);
-
-    // Schema helpers
-    bool ensureSoftDeleteColumns(QSqlDatabase& db, const QString& tableName);
-    
+   
     // Export helpers
     ExportResult doExportItems(const QVector<ItemId>& itemIds, const QString& lpTin);
     ExportResult doExportBoxes(const QVector<BoxId>& boxIds, const QString& lpTin);
