@@ -11,7 +11,7 @@
 
 namespace core {
 
-class DbService;
+class DbServiceAsyncWrapper;
 
 /**
  * @brief Database configuration dialog
@@ -22,7 +22,7 @@ class ConfigDialog : public QDialog {
     Q_OBJECT
 
 public:
-    explicit ConfigDialog(DbService* db, const AppConfig& config, QWidget* parent = nullptr);
+    explicit ConfigDialog(DbServiceAsyncWrapper* db, const AppConfig& config, QWidget* parent = nullptr);
     
     AppConfig config() const { return config_; }
     bool isConnected() const { return connected_; }
@@ -38,7 +38,7 @@ private:
     void loadConfig();
     void updateButtonStates();
 
-    DbService* db_;
+    DbServiceAsyncWrapper* db_;
     AppConfig config_;
     bool connected_ = false;
     

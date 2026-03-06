@@ -812,7 +812,7 @@ bool DbService::doDeleteImportDocument(ImportDocumentId docId, const QString& ta
         "SELECT COUNT(*) FROM %1 t "
         "INNER JOIN %2 j ON t.id = j.%3 "
         "WHERE j.import_doc_id = %4 AND t.status = %5 AND t.is_deleted = false"
-    ).arg(tableName, junctionTableName, entityIdCol).arg(docId).arg(BaseStatus::Exported);
+    ).arg(tableName, junctionTableName, entityIdCol).arg(docId).arg(30);
 
     if (!checkQuery.exec(checkSql) || !checkQuery.next()) {
         db.rollback();
@@ -1374,7 +1374,7 @@ int DbService::countSealedBoxesNotOnPallet(ProductionLineId lineId) {
     }
     
     query.prepare(sql);
-    query.bindValue(":st", static_cast<int>(BaseStatus::Assigned));
+    query.bindValue(":st", static_cast<int>(BoxStatus::Sealed));
     if (lineId > 0) {
         query.bindValue(":lineId", lineId);
     }
@@ -1437,8 +1437,8 @@ bool DbService::sealBox(BoxId id) {
         "WHERE id = :id AND status = :st"
     );
     query.bindValue(":id", id);
-    query.bindValue(":nst", static_cast<int>(BaseStatus::Assigned));
-    query.bindValue(":st", static_cast<int>(BaseStatus::New));
+    query.bindValue(":nst", static_cast<int>(BoxStatus::Sealed));
+    query.bindValue(":st", static_cast<int>(BoxStatus::Empty));
 
     
     if (query.exec() && query.numRowsAffected() > 0) {
@@ -1848,7 +1848,7 @@ ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QStr
     // Update item statuses to Exported
     QString updateSql = QString(
         "UPDATE items SET status = %1 WHERE id IN (%2)"
-    ).arg(ItemStatus::Exported).arg(idList);
+    ).arg(static_cast<int>(ItemStatus::Exported)).arg(idList);
     
     QSqlQuery updateQuery(db);
     if (!updateQuery.exec(updateSql)) {
@@ -2367,7 +2367,7 @@ ProductionStats DbService::getStats(std::optional<ProductionLineId> lineId) {
             } else if (status == static_cast<int>(PalletStatus::Complete)) {
                 stats.completePallets = count;
             } else {
-                stats.inProgressPallets = count; 
+                stats.newPallets = count;
 			}
         }
     }
@@ -3485,7 +3485,7 @@ bool DbService::completePallet(PalletId id) {
         "WHERE id = :id AND status = 0"
     );
     query.bindValue(":id", id);
-	query.bindValue(":st", static_cast<int>(PalletStatus::Completed));
+	query.bindValue(":st", static_cast<int>(PalletStatus::Complete));
 
     return query.exec() && query.numRowsAffected() > 0;
 }
