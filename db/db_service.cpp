@@ -1861,8 +1861,8 @@ ExportResult DbService::doExportItems(const QVector<ItemId>& itemIds, const QStr
     
     // Update item statuses to Exported
     QString updateSql = QString(
-        "UPDATE items SET status = %2 WHERE id IN (%1)"
-    ).arg(idList).arg(static_cast<int>(ItemStatus::Exported));
+        "UPDATE items SET status = %1 WHERE id IN (%2)"
+    ).arg(static_cast<int>(ItemStatus::Exported)).arg(idList);
 
     QSqlQuery updateQuery(db);
     if (!updateQuery.exec(updateSql)) {
