@@ -1,5 +1,5 @@
 #include "config_dialog.h"
-#include "../db/db_service_async_wrapper.h"
+#include "../db/db_service.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -10,7 +10,7 @@
 
 namespace core {
 
-ConfigDialog::ConfigDialog(DbServiceAsyncWrapper* db, const AppConfig& config, QWidget* parent)
+ConfigDialog::ConfigDialog(DbService* db, const AppConfig& config, QWidget* parent)
     : QDialog(parent)
     , db_(db)
     , config_(config)
@@ -179,7 +179,7 @@ void ConfigDialog::onConnect() {
     config_.user = userEdit_->text();
     config_.password = passwordEdit_->text();
     
-    if (db_->connectToDB(config_)) {
+    if (db_->connect(config_)) {
         connected_ = true;
         statusLabel_->setText("Connected successfully!");
         statusLabel_->setStyleSheet("color: green; font-weight: bold;");
